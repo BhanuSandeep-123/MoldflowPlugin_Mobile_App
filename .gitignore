@@ -1,0 +1,10 @@
+.env
+.venv/
+.cloud_venv/
+__pycache__/
+*.pyc
+*.db
+*.dump
+*.log
+firebase-service-account.json
+start_backend.ps1
