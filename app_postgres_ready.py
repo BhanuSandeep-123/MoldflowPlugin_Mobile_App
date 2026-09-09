@@ -1239,6 +1239,41 @@ def register_device(
 
         conn.commit()
 
+    # ------------------------------------------------------------------------
+    # Catch-up: Check for active INPROGRESS jobs where STARTED notification has
+    # not yet been delivered (e.g. job started before this device registered).
+    # ------------------------------------------------------------------------
+    authenticated_user_id = user["user_id"]
+    try:
+        with get_db() as conn:
+            active_candidates = db_execute(
+                conn,
+                """
+                SELECT job_id, name, status, percent, finished, error_message
+                FROM jobs
+                WHERE user_id = ?
+                ORDER BY created_at ASC
+                """,
+                (authenticated_user_id,),
+            ).fetchall()
+
+        for candidate in active_candidates:
+            if _bool_value(candidate["finished"]):
+                continue
+            curr_status = (candidate["status"] or "").strip().upper()
+            if curr_status != "INPROGRESS":
+                continue
+            send_job_completion_notification(
+                user_id=authenticated_user_id,
+                job_id=candidate["job_id"],
+                job_name=candidate["name"] or candidate["job_id"],
+                status_value=candidate["status"],
+                percent=candidate["percent"],
+                error_message=candidate["error_message"],
+            )
+    except Exception as ex:
+        print(f"[DEVICE] Catch-up notification check failed: {ex}")
+
     return {
         "registered": True,
         "device_id": device.device_id,
@@ -1372,6 +1407,8 @@ def send_job_completion_notification(
                     "percent": str(
                         percent if percent is not None else 0
                     ),
+                    "title": title,
+                    "body": body,
                 },
             )
 
