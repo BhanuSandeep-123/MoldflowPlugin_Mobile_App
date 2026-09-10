@@ -1261,7 +1261,7 @@ def register_device(
             if _bool_value(candidate["finished"]):
                 continue
             curr_status = (candidate["status"] or "").strip().upper()
-            if curr_status != "INPROGRESS":
+            if curr_status not in ("INPROGRESS", "STARTED"):
                 continue
             send_job_completion_notification(
                 user_id=authenticated_user_id,
@@ -1311,6 +1311,7 @@ def send_job_completion_notification(
 
     if normalized_status not in {
         "INPROGRESS",
+        "STARTED",
         "COMPLETED",
         "FAILED",
         "CANCELED",
@@ -1320,7 +1321,8 @@ def send_job_completion_notification(
     # INPROGRESS is the SCM's real "the solver is actually running" status
     # (there is no "RUNNING" in that vocabulary) -- surfaced to the user as
     # a "Started" notification, distinct from the terminal ones below.
-    notification_type = "STARTED" if normalized_status == "INPROGRESS" else normalized_status
+    # Explicit "STARTED" from post-Analyze agent or client maps to the same notification.
+    notification_type = "STARTED" if normalized_status in ("INPROGRESS", "STARTED") else normalized_status
 
     with get_db() as conn:
         existing = db_execute(
@@ -1368,7 +1370,7 @@ def send_job_completion_notification(
         )
         return
 
-    if normalized_status == "INPROGRESS":
+    if normalized_status in ("INPROGRESS", "STARTED"):
         title = "Moldflow Analysis Started"
         body = f"{job_name} has started running."
     elif normalized_status == "COMPLETED":
@@ -1403,7 +1405,7 @@ def send_job_completion_notification(
                     "job_id": job_id,
                     "job_name": job_name,
                     "status": normalized_status,
-                    "notification_type": f"JOB_{normalized_status}",
+                    "notification_type": f"JOB_{notification_type}",
                     "percent": str(
                         percent if percent is not None else 0
                     ),
