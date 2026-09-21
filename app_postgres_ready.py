@@ -33,6 +33,11 @@ from jwt.exceptions import InvalidTokenError
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 
+import sys
+_backend_dir = str(Path(__file__).resolve().parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
 from fcm_service import send_fcm_notification, UnregisteredDeviceError
 
 
