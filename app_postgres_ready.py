@@ -543,6 +543,15 @@ def init_database() -> None:
         )
 
         # ----------------------------------------------------------------
+        # Network License Subsystem Tables
+        # ----------------------------------------------------------------
+        try:
+            from license_persistence import init_license_tables
+            init_license_tables(conn)
+        except Exception as lic_err:
+            print(f"[License] Warning: could not initialize license tables: {lic_err}")
+
+        # ----------------------------------------------------------------
         # Development user
         # ----------------------------------------------------------------
         timestamp = now_utc()
@@ -1405,7 +1414,7 @@ def send_job_completion_notification(
                     "job_id": job_id,
                     "job_name": job_name,
                     "status": normalized_status,
-                    "notification_type": f"JOB_{notification_type}",
+                    "notification_type": f"JOB_{normalized_status}",
                     "percent": str(
                         percent if percent is not None else 0
                     ),
@@ -1595,7 +1604,7 @@ def report_job_status(
                         jobs.compute_source
                     ),
                 scm_user =
-                    COALESCE(excluded.scm_user, jobs.scm_user),
+                    COALESCE(NULLIF(excluded.scm_user, ''), jobs.scm_user),
                 worker =
                     COALESCE(excluded.worker, jobs.worker),
                 parent_job_id =
@@ -2030,3 +2039,13 @@ def active_jobs_for_machine(
         result.append(item)
 
     return result
+
+
+# ============================================================================
+# Network License Subsystem - Ingestion & Mobile Read Routers
+# ============================================================================
+from license_ingestion import router as license_router
+app.include_router(license_router)
+
+from license_routes import router as license_read_router
+app.include_router(license_read_router)
