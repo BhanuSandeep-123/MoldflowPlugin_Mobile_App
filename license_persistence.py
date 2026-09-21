@@ -509,7 +509,7 @@ class LicensePersistenceService:
                             cid, server_id, co.username, co.machine_name, co.display,
                             co.package_feature, co.selected_component, co.version,
                             co.server_handle, co.checkout_time, co.checkout_time_precision,
-                            co.pid, 1 if co.is_borrowed else 0, 1 if co.is_incomplete else 0,
+                            co.pid, bool(co.is_borrowed), bool(co.is_incomplete),
                             co.anomaly_note, ts, ts, snapshot_id
                         )
                     )

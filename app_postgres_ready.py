@@ -946,6 +946,7 @@ def health() -> dict[str, Any]:
             if USE_POSTGRES and pg_pool is not None
             else None
         ),
+        "version": "stage7-robust-v1",
         "timestamp": now_utc(),
     }
 

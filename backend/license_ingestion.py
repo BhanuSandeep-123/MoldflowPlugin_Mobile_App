@@ -213,17 +213,20 @@ def ingest_license_status(
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
-    # Persist snapshot, update current state, and run snapshot diff engine
-    from app_postgres_ready import get_db
-    from license_persistence import LicensePersistenceService
-
-    with get_db() as conn:
-        persistence_result = LicensePersistenceService.process_snapshot(
-            conn,
-            snapshot=snapshot,
-            duration_ms=elapsed_ms,
+    try:
+        with get_db() as conn:
+            persistence_result = LicensePersistenceService.process_snapshot(
+                conn,
+                snapshot=snapshot,
+                duration_ms=elapsed_ms,
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.exception(f"[License Ingestion] Failed to process snapshot: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Persistence error: {type(exc).__name__}: {str(exc)}",
         )
-        conn.commit()
 
     # Safe operational logging without sensitive secrets or raw license data
     logger.info(
