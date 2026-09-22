@@ -213,6 +213,9 @@ def ingest_license_status(
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
+    from app_postgres_ready import get_db
+    from license_persistence import LicensePersistenceService
+
     try:
         with get_db() as conn:
             persistence_result = LicensePersistenceService.process_snapshot(
