@@ -683,6 +683,72 @@ def init_database() -> None:
             ),
         )
 
+        # ----------------------------------------------------------------
+        # Multi-workstation clients
+        # ----------------------------------------------------------------
+        additional_clients: list[tuple[str, str, str, str]] = [
+            ("client-key-desktop-23tmnr6-2026", DEV_USER_ID, "DESKTOP-23TMNR6", "Workstation DESKTOP-23TMNR6"),
+        ]
+
+        extra_env = os.getenv("MOLDFLOW_EXTRA_CLIENTS", "").strip()
+        if extra_env:
+            for entry in extra_env.split(";"):
+                parts = [p.strip() for p in entry.split(",") if p.strip()]
+                if len(parts) >= 3:
+                    k, u, m = parts[0], parts[1], parts[2]
+                    n = parts[3] if len(parts) > 3 else f"Workstation {m}"
+                    additional_clients.append((k, u, m, n))
+
+        for c_key, c_user, c_machine, c_name in additional_clients:
+            db_execute(
+                conn,
+                """
+                INSERT INTO machines (
+                    machine_id,
+                    user_id,
+                    machine_name,
+                    created_at,
+                    last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(machine_id)
+                DO UPDATE SET
+                    user_id = excluded.user_id,
+                    machine_name = excluded.machine_name
+                """,
+                (
+                    c_machine,
+                    c_user,
+                    c_name,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            db_execute(
+                conn,
+                """
+                INSERT INTO api_clients (
+                    api_key,
+                    user_id,
+                    machine_id,
+                    enabled,
+                    created_at
+                )
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(api_key)
+                DO UPDATE SET
+                    user_id = excluded.user_id,
+                    machine_id = excluded.machine_id,
+                    enabled = 1
+                """,
+                (
+                    c_key,
+                    c_user,
+                    c_machine,
+                    timestamp,
+                ),
+            )
+
         conn.commit()
 
 
@@ -946,7 +1012,7 @@ def health() -> dict[str, Any]:
             if USE_POSTGRES and pg_pool is not None
             else None
         ),
-        "version": "stage7-robust-v1",
+        "version": "stage8-multimachine-v1",
         "timestamp": now_utc(),
     }
 
@@ -2050,8 +2116,87 @@ def active_jobs_for_machine(
 # ============================================================================
 # Network License Subsystem - Ingestion & Mobile Read Routers
 # ============================================================================
-from license_ingestion import router as license_router
+from license_ingestion import router as license_router, verify_license_ingestion_key
 app.include_router(license_router)
 
 from license_routes import router as license_read_router
 app.include_router(license_read_router)
+
+
+# ============================================================================
+# Workstation Registration Endpoint
+# ============================================================================
+
+class RegisterClientRequest(BaseModel):
+    api_key: str = Field(min_length=8)
+    user_id: str = Field(min_length=1)
+    machine_id: str = Field(min_length=1)
+    machine_name: str = ""
+
+
+@app.post("/internal/register-client")
+def register_client_internal(
+    payload: RegisterClientRequest,
+    _auth: None = Depends(verify_license_ingestion_key),
+) -> dict[str, Any]:
+    """Secure internal administrative endpoint to register or update workstation API clients."""
+    now = now_utc()
+    m_name = payload.machine_name.strip() or f"Workstation {payload.machine_id}"
+    with get_db() as conn:
+        user_row = db_execute(
+            conn,
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (payload.user_id,),
+        ).fetchone()
+        if user_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User {payload.user_id} does not exist",
+            )
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO machines (
+                machine_id,
+                user_id,
+                machine_name,
+                created_at,
+                last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(machine_id)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                machine_name = excluded.machine_name
+            """,
+            (payload.machine_id, payload.user_id, m_name, now, now),
+        )
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO api_clients (
+                api_key,
+                user_id,
+                machine_id,
+                enabled,
+                created_at
+            )
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(api_key)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                machine_id = excluded.machine_id,
+                enabled = 1
+            """,
+            (payload.api_key, payload.user_id, payload.machine_id, now),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "api_key": payload.api_key[:6] + "..." + payload.api_key[-4:],
+        "user_id": payload.user_id,
+        "machine_id": payload.machine_id,
+    }
