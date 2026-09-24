@@ -18,7 +18,10 @@ is explicitly configured.
 
 from __future__ import annotations
 
+import hmac
 import os
+import re
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -513,8 +516,36 @@ def init_database() -> None:
         )
 
         # ----------------------------------------------------------------
+        # Workstation Enrollment Tokens (one-time, expiring authority)
+        # ----------------------------------------------------------------
+        db_execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS enrollment_tokens (
+                token TEXT PRIMARY KEY,
+                user_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                consumed_by_machine_id TEXT,
+                FOREIGN KEY(user_id)
+                    REFERENCES users(user_id)
+                    ON DELETE SET NULL
+            )
+            """,
+        )
+
+        # ----------------------------------------------------------------
         # Indexes
         # ----------------------------------------------------------------
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_expires_at
+            ON enrollment_tokens(expires_at)
+            """,
+        )
+
         db_execute(
             conn,
             """
@@ -682,6 +713,72 @@ def init_database() -> None:
                 timestamp,
             ),
         )
+
+        # ----------------------------------------------------------------
+        # Multi-workstation clients
+        # ----------------------------------------------------------------
+        additional_clients: list[tuple[str, str, str, str]] = [
+            ("client-key-desktop-23tmnr6-2026", DEV_USER_ID, "DESKTOP-23TMNR6", "Workstation DESKTOP-23TMNR6"),
+        ]
+
+        extra_env = os.getenv("MOLDFLOW_EXTRA_CLIENTS", "").strip()
+        if extra_env:
+            for entry in extra_env.split(";"):
+                parts = [p.strip() for p in entry.split(",") if p.strip()]
+                if len(parts) >= 3:
+                    k, u, m = parts[0], parts[1], parts[2]
+                    n = parts[3] if len(parts) > 3 else f"Workstation {m}"
+                    additional_clients.append((k, u, m, n))
+
+        for c_key, c_user, c_machine, c_name in additional_clients:
+            db_execute(
+                conn,
+                """
+                INSERT INTO machines (
+                    machine_id,
+                    user_id,
+                    machine_name,
+                    created_at,
+                    last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(machine_id)
+                DO UPDATE SET
+                    user_id = excluded.user_id,
+                    machine_name = excluded.machine_name
+                """,
+                (
+                    c_machine,
+                    c_user,
+                    c_name,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            db_execute(
+                conn,
+                """
+                INSERT INTO api_clients (
+                    api_key,
+                    user_id,
+                    machine_id,
+                    enabled,
+                    created_at
+                )
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(api_key)
+                DO UPDATE SET
+                    user_id = excluded.user_id,
+                    machine_id = excluded.machine_id,
+                    enabled = 1
+                """,
+                (
+                    c_key,
+                    c_user,
+                    c_machine,
+                    timestamp,
+                ),
+            )
 
         conn.commit()
 
@@ -946,7 +1043,7 @@ def health() -> dict[str, Any]:
             if USE_POSTGRES and pg_pool is not None
             else None
         ),
-        "version": "stage7-robust-v1",
+        "version": "stage8-enrollment-v1",
         "timestamp": now_utc(),
     }
 
@@ -2050,8 +2147,385 @@ def active_jobs_for_machine(
 # ============================================================================
 # Network License Subsystem - Ingestion & Mobile Read Routers
 # ============================================================================
-from license_ingestion import router as license_router
+from license_ingestion import router as license_router, verify_license_ingestion_key, get_license_ingestion_key
 app.include_router(license_router)
 
 from license_routes import router as license_read_router
 app.include_router(license_read_router)
+
+
+# ============================================================================
+# Workstation Enrollment & Registration Endpoints
+# ============================================================================
+
+def get_workstation_enrollment_key() -> str | None:
+    """
+    Reads WORKSTATION_ENROLLMENT_KEY from environment.
+    Strictly isolated: NO fallback to LICENSE_INGESTION_KEY or any default secret.
+    """
+    key = os.getenv("WORKSTATION_ENROLLMENT_KEY")
+    if key is not None and key.strip():
+        return key.strip()
+    return None
+
+
+def create_enrollment_token(
+    user_id: str | None = None,
+    expires_in_seconds: int = 3600,
+) -> dict[str, Any]:
+    """
+    Creates a cryptographically secure, one-time, expiring enrollment token.
+    Stored in the database and consumed upon first successful enrollment.
+    """
+    token = f"mf-enroll-{secrets.token_hex(24)}"
+    now = now_utc()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).isoformat()
+
+    with get_db() as conn:
+        if user_id:
+            user_row = db_execute(
+                conn,
+                "SELECT user_id FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if user_row is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"User '{user_id}' does not exist",
+                )
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO enrollment_tokens (
+                token,
+                user_id,
+                created_at,
+                expires_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (token, user_id, now, expires_at),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "token": token,
+        "user_id": user_id,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+
+
+def verify_enrollment_authority(
+    x_enrollment_token: str | None = Header(default=None, alias="X-Enrollment-Token"),
+    auth_header: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    """
+    Validates authority to enroll a workstation.
+    Dedicated workstation enrollment authority only.
+
+    Security rules:
+    - Does NOT accept LICENSE_INGESTION_KEY or any license monitor credential.
+    - Does NOT accept ordinary mobile / user JWTs.
+    - Fails closed if no valid token or authority is configured.
+
+    Supports:
+    1. One-time expiring enrollment tokens stored in enrollment_tokens table.
+    2. Master WORKSTATION_ENROLLMENT_KEY (if explicitly configured on server).
+    """
+    token: str | None = None
+    if x_enrollment_token and x_enrollment_token.strip():
+        token = x_enrollment_token.strip()
+    elif auth_header and auth_header.strip():
+        raw = auth_header.strip()
+        if raw.lower().startswith("bearer "):
+            token = raw[7:].strip()
+        else:
+            token = raw
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing enrollment token (provide X-Enrollment-Token or Authorization Bearer header)",
+        )
+
+    # 1. Check one-time expiring token from database
+    now = now_utc()
+    with get_db() as conn:
+        row = db_execute(
+            conn,
+            """
+            SELECT token, user_id, created_at, expires_at, consumed_at, consumed_by_machine_id
+            FROM enrollment_tokens
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+        if row is not None:
+            # Replay rejection: check if already consumed
+            if row["consumed_at"] is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Enrollment token has already been consumed (one-time use only)",
+                )
+
+            # Expiration check
+            if row["expires_at"] < now:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Enrollment token has expired",
+                )
+
+            return {
+                "auth_type": "one_time_token",
+                "token": token,
+                "bound_user_id": row["user_id"],
+            }
+
+    # 2. Check master WORKSTATION_ENROLLMENT_KEY (if explicitly configured in environment)
+    server_enrollment_key = get_workstation_enrollment_key()
+    if server_enrollment_key:
+        if hmac.compare_digest(token, server_enrollment_key):
+            return {
+                "auth_type": "master_enrollment_key",
+                "role": "admin",
+                "token": token,
+            }
+
+    # Neither matched -> fail closed with 401 Unauthorized
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired enrollment token",
+    )
+
+
+class CreateEnrollmentTokenRequest(BaseModel):
+    user_id: str | None = None
+    expires_in_minutes: int = Field(default=60, ge=1, le=10080)
+
+
+@app.post("/api/workstation/enrollment-token")
+def issue_enrollment_token_endpoint(
+    req: CreateEnrollmentTokenRequest,
+    auth: dict[str, Any] = Depends(verify_enrollment_authority),
+) -> dict[str, Any]:
+    """
+    Issues a one-time expiring workstation enrollment token.
+    Requires master workstation enrollment authority.
+    """
+    if auth.get("auth_type") != "master_enrollment_key":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Master workstation enrollment authority required to issue tokens",
+        )
+    return create_enrollment_token(
+        user_id=req.user_id,
+        expires_in_seconds=req.expires_in_minutes * 60,
+    )
+
+
+class WorkstationEnrollRequest(BaseModel):
+    machine_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=128)
+    machine_name: str | None = Field(default=None, max_length=128)
+
+
+class WorkstationEnrollResponse(BaseModel):
+    status: str
+    machine_id: str
+    machine_name: str
+    user_id: str
+    api_key: str
+    backend_url: str | None = None
+    enrolled_at: str
+    registered_at: str
+    message: str
+
+
+@app.post("/api/workstation/enroll", response_model=WorkstationEnrollResponse)
+def enroll_workstation_endpoint(
+    payload: WorkstationEnrollRequest,
+    _auth: dict[str, Any] = Depends(verify_enrollment_authority),
+) -> WorkstationEnrollResponse:
+    """
+    Secure workstation onboarding endpoint for installers and runtime agents.
+    Generates a cryptographically random, high-entropy API key (256 bits), registers or
+    updates the machine record, and activates the client key.
+    """
+    now = now_utc()
+    m_name = (payload.machine_name or "").strip() or f"Workstation {payload.machine_id}"
+
+    with get_db() as conn:
+        user_row = db_execute(
+            conn,
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (payload.user_id,),
+        ).fetchone()
+        if user_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User '{payload.user_id}' does not exist",
+            )
+
+        # If authenticated via one-time token, verify user binding and consume
+        if _auth.get("auth_type") == "one_time_token":
+            bound_user = _auth.get("bound_user_id")
+            if bound_user and bound_user != payload.user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Enrollment token is bound to user '{bound_user}', but request specified '{payload.user_id}'",
+                )
+            res = db_execute(
+                conn,
+                """
+                UPDATE enrollment_tokens
+                SET consumed_at = ?, consumed_by_machine_id = ?
+                WHERE token = ? AND consumed_at IS NULL
+                """,
+                (now, payload.machine_id, _auth["token"]),
+            )
+            if hasattr(res, "rowcount") and res.rowcount == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Enrollment token was consumed concurrently",
+                )
+
+        # 1. Upsert machine record
+        db_execute(
+            conn,
+            """
+            INSERT INTO machines (
+                machine_id,
+                user_id,
+                machine_name,
+                created_at,
+                last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(machine_id)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                machine_name = excluded.machine_name,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (payload.machine_id, payload.user_id, m_name, now, now),
+        )
+
+        # 2. Generate secure, high-entropy API key (256-bit cryptographic entropy via secrets.token_hex(32))
+        clean_machine = re.sub(r"[^a-zA-Z0-9_\-]", "", payload.machine_id)[:32] or "workstation"
+        entropy = secrets.token_hex(32)
+        generated_api_key = f"mf-client-{clean_machine}-{entropy}"
+
+        # 3. Rotate previous keys for this machine to enabled = 0
+        db_execute(
+            conn,
+            "UPDATE api_clients SET enabled = 0 WHERE machine_id = ?",
+            (payload.machine_id,),
+        )
+
+        # 4. Insert new active key with enabled = 1
+        db_execute(
+            conn,
+            """
+            INSERT INTO api_clients (
+                api_key,
+                user_id,
+                machine_id,
+                enabled,
+                created_at
+            )
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (generated_api_key, payload.user_id, payload.machine_id, now),
+        )
+        conn.commit()
+
+    return WorkstationEnrollResponse(
+        status="success",
+        machine_id=payload.machine_id,
+        machine_name=m_name,
+        user_id=payload.user_id,
+        api_key=generated_api_key,
+        backend_url=None,
+        enrolled_at=now,
+        registered_at=now,
+        message="Workstation enrolled successfully",
+    )
+
+
+class RegisterClientRequest(BaseModel):
+    api_key: str = Field(min_length=8)
+    user_id: str = Field(min_length=1)
+    machine_id: str = Field(min_length=1)
+    machine_name: str = ""
+
+
+@app.post("/internal/register-client")
+def register_client_internal(
+    payload: RegisterClientRequest,
+    _auth: None = Depends(verify_license_ingestion_key),
+) -> dict[str, Any]:
+    """Secure internal administrative endpoint to register or update workstation API clients."""
+    now = now_utc()
+    m_name = payload.machine_name.strip() or f"Workstation {payload.machine_id}"
+    with get_db() as conn:
+        user_row = db_execute(
+            conn,
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (payload.user_id,),
+        ).fetchone()
+        if user_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User {payload.user_id} does not exist",
+            )
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO machines (
+                machine_id,
+                user_id,
+                machine_name,
+                created_at,
+                last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(machine_id)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                machine_name = excluded.machine_name
+            """,
+            (payload.machine_id, payload.user_id, m_name, now, now),
+        )
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO api_clients (
+                api_key,
+                user_id,
+                machine_id,
+                enabled,
+                created_at
+            )
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(api_key)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                machine_id = excluded.machine_id,
+                enabled = 1
+            """,
+            (payload.api_key, payload.user_id, payload.machine_id, now),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "api_key": payload.api_key[:6] + "..." + payload.api_key[-4:],
+        "user_id": payload.user_id,
+        "machine_id": payload.machine_id,
+    }
