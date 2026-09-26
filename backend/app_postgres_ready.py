@@ -2542,6 +2542,112 @@ def enroll_workstation_endpoint(
     )
 
 
+# ============================================================================
+# Admin: mobile user -> workstation access provisioning (separate from mobile routes)
+# ============================================================================
+#
+# One-time / occasional provisioning without database shell access. Protected by a dedicated
+# secret configured in the MACHINE_ACCESS_ADMIN_SECRET environment variable (set it in Render ->
+# Environment BEFORE deploying). It accepts nothing else: not mobile JWTs, not enrollment tokens,
+# not license or workstation API keys. Fails closed when the secret is unset or too short.
+# The routes are excluded from the OpenAPI schema and never touch jobs.user_id.
+
+_MACHINE_ACCESS_ADMIN_SECRET_MIN_LENGTH = 24
+
+
+def verify_machine_access_admin(
+    x_admin_secret: str | None = Header(default=None, alias="X-Admin-Secret"),
+) -> None:
+    expected = (os.getenv("MACHINE_ACCESS_ADMIN_SECRET") or "").strip()
+    if len(expected) < _MACHINE_ACCESS_ADMIN_SECRET_MIN_LENGTH:
+        # Unconfigured (or weak) => the endpoints are disabled. Same response as a wrong secret so the
+        # state is not revealed to callers; the reason is logged server-side (never the secret itself).
+        print("[ADMIN] machine-access admin endpoints disabled: MACHINE_ACCESS_ADMIN_SECRET is not configured")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+        )
+
+    provided = (x_admin_secret or "").strip()
+    if not provided or not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+        )
+
+
+class MachineAccessAdminRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+    machine_id: str = Field(min_length=1, max_length=128)
+
+
+@app.post("/admin/machine-access/grant", include_in_schema=False)
+def admin_grant_machine_access(
+    payload: MachineAccessAdminRequest,
+    _admin: None = Depends(verify_machine_access_admin),
+) -> dict[str, Any]:
+    user_id = payload.user_id.strip()
+    machine_id = payload.machine_id.strip()
+
+    with get_db() as conn:
+        if db_execute(conn, "SELECT 1 AS ok FROM users WHERE user_id = ?", (user_id,)).fetchone() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        if db_execute(conn, "SELECT 1 AS ok FROM machines WHERE machine_id = ?", (machine_id,)).fetchone() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Machine not found")
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO mobile_user_machine_access (user_id, machine_id, created_at, enabled)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(user_id, machine_id)
+            DO UPDATE SET enabled = 1
+            """,
+            (user_id, machine_id, now_utc()),
+        )
+        conn.commit()
+
+    print(f"[ADMIN] machine access granted: user={user_id} machine={machine_id}")
+    return {"granted": True, "user_id": user_id, "machine_id": machine_id}
+
+
+@app.post("/admin/machine-access/revoke", include_in_schema=False)
+def admin_revoke_machine_access(
+    payload: MachineAccessAdminRequest,
+    _admin: None = Depends(verify_machine_access_admin),
+) -> dict[str, Any]:
+    user_id = payload.user_id.strip()
+    machine_id = payload.machine_id.strip()
+
+    with get_db() as conn:
+        existing = db_execute(
+            conn,
+            """
+            SELECT 1 AS ok
+            FROM mobile_user_machine_access
+            WHERE user_id = ? AND machine_id = ?
+            """,
+            (user_id, machine_id),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access assignment not found")
+
+        db_execute(
+            conn,
+            """
+            UPDATE mobile_user_machine_access
+            SET enabled = 0
+            WHERE user_id = ? AND machine_id = ?
+            """,
+            (user_id, machine_id),
+        )
+        conn.commit()
+
+    print(f"[ADMIN] machine access revoked: user={user_id} machine={machine_id}")
+    return {"revoked": True, "user_id": user_id, "machine_id": machine_id}
+
+
 class RegisterClientRequest(BaseModel):
     api_key: str = Field(min_length=8)
     user_id: str = Field(min_length=1)
