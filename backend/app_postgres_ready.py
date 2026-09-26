@@ -377,6 +377,44 @@ def _bool_value(value: Any) -> bool:
     return bool(value)
 
 
+# A mobile user may see a job when they own it, or when the job ran on a machine that was
+# explicitly (and still) assigned to them. Ownership of the job row is never changed by this.
+# Usage: append to a query over `jobs` and pass (user_id, user_id).
+_JOB_ACCESS_SQL = (
+    "(jobs.user_id = ? OR jobs.machine_id IN ("
+    "SELECT a.machine_id FROM mobile_user_machine_access a "
+    "WHERE a.user_id = ? AND a.enabled = 1))"
+)
+
+
+def _notification_recipient_user_ids(conn, user_id: str, job_id: str) -> list[str]:
+    """Job owner (and the caller) plus every mobile user assigned to the job's machine."""
+    recipients = [user_id]
+    job = db_execute(
+        conn,
+        "SELECT user_id, machine_id FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    if job is not None:
+        if job["user_id"] and job["user_id"] not in recipients:
+            recipients.append(job["user_id"])
+        if job["machine_id"]:
+            rows = db_execute(
+                conn,
+                """
+                SELECT user_id
+                FROM mobile_user_machine_access
+                WHERE machine_id = ?
+                  AND enabled = 1
+                """,
+                (job["machine_id"],),
+            ).fetchall()
+            for row in rows:
+                if row["user_id"] not in recipients:
+                    recipients.append(row["user_id"])
+    return recipients
+
+
 def init_database() -> None:
     with get_db() as conn:
         # ----------------------------------------------------------------
@@ -512,6 +550,34 @@ def init_database() -> None:
                     REFERENCES machines(machine_id)
                     ON DELETE CASCADE
             )
+            """,
+        )
+
+        # ----------------------------------------------------------------
+        # Mobile user -> workstation access (lets a mobile user view jobs from
+        # explicitly assigned machines without changing job ownership)
+        # ----------------------------------------------------------------
+        db_execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS mobile_user_machine_access (
+                user_id TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, machine_id),
+                FOREIGN KEY(user_id)
+                    REFERENCES users(user_id)
+                    ON DELETE CASCADE
+            )
+            """,
+        )
+
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_mobile_access_machine_id
+            ON mobile_user_machine_access(machine_id)
             """,
         )
 
@@ -1154,11 +1220,11 @@ def mobile_jobs(
                 worker,
                 parent_job_id
             FROM jobs
-            WHERE user_id = ?
+            WHERE """ + _JOB_ACCESS_SQL + """
               AND archived = FALSE
             ORDER BY updated_at DESC
             """,
-            (user["user_id"],),
+            (user["user_id"], user["user_id"]),
         ).fetchall()
 
         result = []
@@ -1208,10 +1274,11 @@ def mobile_job(
                 parent_job_id
             FROM jobs
             WHERE job_id = ?
-              AND user_id = ?
+              AND """ + _JOB_ACCESS_SQL + """
             """,
             (
                 job_id,
+                user["user_id"],
                 user["user_id"],
             ),
         ).fetchone()
@@ -1256,11 +1323,12 @@ def mobile_job_events(
             JOIN jobs
                 ON jobs.job_id = job_events.job_id
             WHERE job_events.job_id = ?
-              AND jobs.user_id = ?
+              AND """ + _JOB_ACCESS_SQL + """
             ORDER BY job_events.id ASC
             """,
             (
                 job_id,
+                user["user_id"],
                 user["user_id"],
             ),
         ).fetchall()
@@ -1363,10 +1431,10 @@ def register_device(
                 """
                 SELECT job_id, name, status, percent, finished, error_message
                 FROM jobs
-                WHERE user_id = ?
+                WHERE """ + _JOB_ACCESS_SQL + """
                 ORDER BY created_at ASC
                 """,
-                (authenticated_user_id,),
+                (authenticated_user_id, authenticated_user_id),
             ).fetchall()
 
         for candidate in active_candidates:
@@ -1461,18 +1529,22 @@ def send_job_completion_notification(
         return
 
     with get_db() as conn:
+        # Job owner + any mobile user assigned to the job's workstation. De-duplication above is per
+        # (job, notification type), so widening the recipients does not create duplicate sends.
+        recipient_ids = _notification_recipient_user_ids(conn, user_id, job_id)
+        recipient_marks = ", ".join("?" for _ in recipient_ids)
         devices = db_execute(
             conn,
-            """
-            SELECT device_id, push_token
+            f"""
+            SELECT device_id, user_id AS device_user_id, push_token
             FROM devices
-            WHERE user_id = ?
+            WHERE user_id IN ({recipient_marks})
               AND platform = 'android'
               AND push_token IS NOT NULL
               AND TRIM(push_token) <> ''
             ORDER BY updated_at DESC
             """,
-            (user_id,),
+            tuple(recipient_ids),
         ).fetchall()
 
     if not devices:
@@ -1548,7 +1620,7 @@ def send_job_completion_notification(
                         WHERE device_id = ?
                           AND user_id = ?
                         """,
-                        (device_id, user_id),
+                        (device_id, device["device_user_id"]),
                     )
                     conn.commit()
                 print(
@@ -1876,6 +1948,7 @@ def cancel_job(
                 detail="Job not found",
             )
 
+        # Owner-only: machine access grants read visibility, not control of the job.
         if row["user_id"] != authenticated_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2025,6 +2098,7 @@ def archive_job(
                 detail="Job not found",
             )
 
+        # Owner-only: machine access grants read visibility, not control of the job.
         if row["user_id"] != authenticated_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
