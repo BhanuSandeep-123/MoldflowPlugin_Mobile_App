@@ -2329,7 +2329,8 @@ def issue_enrollment_token_endpoint(
 
 class WorkstationEnrollRequest(BaseModel):
     machine_id: str = Field(min_length=1, max_length=128)
-    user_id: str = Field(min_length=1, max_length=128)
+    # Optional: for one-time tokens the user is derived from the token binding.
+    user_id: str | None = Field(default=None, max_length=128)
     machine_name: str | None = Field(default=None, max_length=128)
 
 
@@ -2358,6 +2359,23 @@ def enroll_workstation_endpoint(
     now = now_utc()
     m_name = (payload.machine_name or "").strip() or f"Workstation {payload.machine_id}"
 
+    # The token is the authority for user identity. A client-supplied user_id is
+    # optional and, when present, must match the token's bound user.
+    requested_user = (payload.user_id or "").strip()
+    bound_user = _auth.get("bound_user_id") if _auth.get("auth_type") == "one_time_token" else None
+    if bound_user and requested_user and requested_user != bound_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Enrollment token is bound to user '{bound_user}', but request specified '{requested_user}'",
+        )
+    effective_user_id = bound_user or requested_user
+    if not effective_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enrollment token is not bound to a user; a user_id is required",
+        )
+    payload.user_id = effective_user_id
+
     with get_db() as conn:
         user_row = db_execute(
             conn,
@@ -2370,14 +2388,8 @@ def enroll_workstation_endpoint(
                 detail=f"User '{payload.user_id}' does not exist",
             )
 
-        # If authenticated via one-time token, verify user binding and consume
+        # If authenticated via one-time token, consume it
         if _auth.get("auth_type") == "one_time_token":
-            bound_user = _auth.get("bound_user_id")
-            if bound_user and bound_user != payload.user_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Enrollment token is bound to user '{bound_user}', but request specified '{payload.user_id}'",
-                )
             res = db_execute(
                 conn,
                 """
