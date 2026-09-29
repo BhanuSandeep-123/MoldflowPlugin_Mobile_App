@@ -1267,7 +1267,6 @@ def autodesk_login(
         ).fetchone()
 
         if row is None:
-            print(f"[AUTH] Unprovisioned Autodesk account attempt: sub={_sub}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Autodesk account is not provisioned for Moldflow Mobile access. Please contact your administrator.",
