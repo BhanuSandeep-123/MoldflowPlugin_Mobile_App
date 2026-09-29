@@ -19,11 +19,14 @@ is explicitly configured.
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
 import threading
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -428,6 +431,7 @@ def init_database() -> None:
                 display_name TEXT NOT NULL,
                 email TEXT NOT NULL DEFAULT '',
                 password_hash TEXT,
+                autodesk_id TEXT,
                 created_at TEXT NOT NULL
             )
             """,
@@ -437,6 +441,13 @@ def init_database() -> None:
             conn,
             "users",
             "password_hash",
+            "TEXT",
+        )
+
+        ensure_column(
+            conn,
+            "users",
+            "autodesk_id",
             "TEXT",
         )
 
@@ -641,6 +652,14 @@ def init_database() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_devices_user_id
             ON devices(user_id)
+            """,
+        )
+
+        db_execute(
+            conn,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_autodesk_id
+            ON users(autodesk_id)
             """,
         )
 
@@ -880,6 +899,10 @@ class JobStatus(BaseModel):
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3)
     password: str = Field(min_length=1)
+
+
+class AutodeskAuthRequest(BaseModel):
+    access_token: str = Field(min_length=1)
 
 
 class DeviceRegistration(BaseModel):
@@ -1158,6 +1181,95 @@ def mobile_login(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password",
+            )
+
+        token, expires_in = create_access_token(
+            row["user_id"]
+        )
+
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": expires_in,
+            "user": {
+                "user_id": row["user_id"],
+                "display_name": row["display_name"],
+                "email": row["email"],
+            },
+        }
+
+
+# ============================================================================
+# Autodesk SSO login
+# ============================================================================
+
+AUTODESK_USERINFO_URL = "https://api.userprofile.autodesk.com/userinfo"
+
+
+@app.post("/auth/autodesk")
+def autodesk_login(
+    payload: AutodeskAuthRequest,
+) -> dict[str, Any]:
+    req = urllib.request.Request(
+        AUTODESK_USERINFO_URL,
+        headers={
+            "Authorization": f"Bearer {payload.access_token}",
+            "User-Agent": "MoldflowMobile-Backend/1.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read().decode("utf-8")
+            userinfo = json.loads(data)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired Autodesk access token",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Autodesk identity service returned an unexpected response",
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Autodesk identity service is currently unreachable",
+        )
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Invalid response payload from Autodesk identity service",
+        )
+
+    autodesk_sub = userinfo.get("sub")
+    if not autodesk_sub or not str(autodesk_sub).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing subject claim in Autodesk profile",
+        )
+
+    _sub = str(autodesk_sub).strip()
+
+    with get_db() as conn:
+        row = db_execute(
+            conn,
+            """
+            SELECT
+                user_id,
+                display_name,
+                email
+            FROM users
+            WHERE autodesk_id = ?
+            """,
+            (_sub,),
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Autodesk account is not provisioned for Moldflow Mobile access. Please contact your administrator.",
             )
 
         token, expires_in = create_access_token(
