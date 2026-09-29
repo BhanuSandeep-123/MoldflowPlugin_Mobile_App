@@ -1004,6 +1004,25 @@ def create_access_token(user_id: str) -> tuple[str, int]:
     return token, int(expires_delta.total_seconds())
 
 
+def verify_user_workstation_entitlement(conn, user_id: str) -> None:
+    entitled = db_execute(
+        conn,
+        """
+        SELECT 1
+        FROM mobile_user_machine_access
+        WHERE user_id = ? AND enabled = 1
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if entitled is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is not authorized for Moldflow Mobile: no enrolled workstation assigned. Please contact your administrator.",
+        )
+
+
 def get_mobile_user(
     credentials: HTTPAuthorizationCredentials | None =
     Depends(bearer_scheme),
@@ -1183,6 +1202,8 @@ def mobile_login(
                 detail="Invalid email or password",
             )
 
+        verify_user_workstation_entitlement(conn, row["user_id"])
+
         token, expires_in = create_access_token(
             row["user_id"]
         )
@@ -1271,6 +1292,8 @@ def autodesk_login(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Autodesk account is not provisioned for Moldflow Mobile access. Please contact your administrator.",
             )
+
+        verify_user_workstation_entitlement(conn, row["user_id"])
 
         token, expires_in = create_access_token(
             row["user_id"]
