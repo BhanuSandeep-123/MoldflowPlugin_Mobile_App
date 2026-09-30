@@ -488,6 +488,103 @@ def list_machine_access(
         return [dict(r) for r in rows]
 
 
+def link_autodesk_identity(
+    user_identifier: str,
+    autodesk_sub: str,
+    db_target: str | None = None,
+) -> dict[str, Any]:
+    """
+    Safely associates an Autodesk OAuth Subject claim ('sub') with an existing internal user.
+    Enforces:
+    - Non-empty inputs
+    - Resolves user by exact user_id or lower(email)
+    - Rejects if user does not exist (no DB change)
+    - Rejects if the sub is already linked to another user (no DB change)
+    - Rejects if the user already has a different Autodesk identity linked (no silent overwrite)
+    - Idempotent: returns success without update if already linked to this exact sub
+    - Parameterized atomic UPDATE in an explicit transaction
+    """
+    clean_user = (user_identifier or "").strip()
+    clean_sub = (autodesk_sub or "").strip()
+
+    if not clean_user:
+        raise ValueError("User identifier (--user) cannot be empty")
+    if not clean_sub:
+        raise ValueError("Autodesk sub (--sub) cannot be empty")
+
+    with get_db_connection(db_target) as conn:
+        # Resolve user by exact user_id first, then by lower(email)
+        user_row = db_execute(
+            conn,
+            "SELECT user_id, display_name, email, autodesk_id FROM users WHERE user_id = ?",
+            (clean_user,),
+        ).fetchone()
+
+        if user_row is None:
+            user_row = db_execute(
+                conn,
+                "SELECT user_id, display_name, email, autodesk_id FROM users WHERE lower(email) = lower(?)",
+                (clean_user,),
+            ).fetchone()
+
+        if user_row is None:
+            raise ValueError(f"User '{clean_user}' not found (checked user_id and email)")
+
+        target_user_id = user_row["user_id"]
+        current_sub = (user_row["autodesk_id"] or "").strip()
+
+        # Check if sub is already assigned to a DIFFERENT user
+        existing_sub_user = db_execute(
+            conn,
+            "SELECT user_id, email FROM users WHERE autodesk_id = ?",
+            (clean_sub,),
+        ).fetchone()
+
+        if existing_sub_user is not None and existing_sub_user["user_id"] != target_user_id:
+            raise ValueError(
+                f"Autodesk sub '{clean_sub}' is already linked to another user: "
+                f"{existing_sub_user['user_id']} ({existing_sub_user.get('email') or 'no email'})"
+            )
+
+        # Check if target user has a different sub already linked
+        if current_sub and current_sub != clean_sub:
+            raise ValueError(
+                f"User '{target_user_id}' already has a different Autodesk identity linked: "
+                f"'{current_sub}'. Silently overwriting an existing identity is not allowed."
+            )
+
+        # Idempotent case: already linked to the exact same sub
+        if current_sub == clean_sub:
+            return {
+                "status": "already_linked",
+                "user_id": target_user_id,
+                "email": user_row["email"],
+                "display_name": user_row["display_name"],
+                "autodesk_sub": clean_sub,
+                "updated": False,
+            }
+
+        # Parameterized update within the active transaction
+        db_execute(
+            conn,
+            """
+            UPDATE users
+            SET autodesk_id = ?
+            WHERE user_id = ?
+            """,
+            (clean_sub, target_user_id),
+        )
+
+    return {
+        "status": "success",
+        "user_id": target_user_id,
+        "email": user_row["email"],
+        "display_name": user_row["display_name"],
+        "autodesk_sub": clean_sub,
+        "updated": True,
+    }
+
+
 # ============================================================================
 # CLI Entrypoint
 # ============================================================================
@@ -549,6 +646,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_lacc = subparsers.add_parser("list-machine-access", help="List mobile user -> workstation access assignments")
     p_lacc.add_argument("--user-id", default=None, help="Filter by mobile user ID")
+
+    # 9. link-autodesk
+    p_link = subparsers.add_parser(
+        "link-autodesk",
+        help="Associate an Autodesk OAuth subject claim (sub) with an existing internal user",
+    )
+    p_link.add_argument("--user", required=True, help="Target user ID or email address")
+    p_link.add_argument("--sub", required=True, help="Autodesk OAuth subject identifier (sub)")
 
     return parser
 
@@ -690,6 +795,24 @@ def main() -> None:
                 mach = t.get("consumed_by_machine_id") or "-"
                 print(f"{t['token']:<38} {t.get('user_id') or '-':<22} {t['state']:<10} {t['expires_at']:<26} {mach}")
             print()
+
+        elif args.command == "link-autodesk":
+            res = link_autodesk_identity(
+                user_identifier=args.user,
+                autodesk_sub=args.sub,
+                db_target=db_target,
+            )
+            if res.get("updated", True):
+                print("\n[SUCCESS] Autodesk identity linked successfully:")
+                print(f"  User ID:      {res['user_id']}")
+                print(f"  Email:        {res['email']}")
+                print(f"  Autodesk Sub: {res['autodesk_sub']}")
+                print("  (Autodesk OAuth login is now enabled for this user)\n")
+            else:
+                print("\n[INFO] Autodesk identity already linked (idempotent):")
+                print(f"  User ID:      {res['user_id']}")
+                print(f"  Email:        {res['email']}")
+                print(f"  Autodesk Sub: {res['autodesk_sub']}\n")
 
     except Exception as ex:
         print(f"\n[ERROR] {ex}\n", file=sys.stderr)
