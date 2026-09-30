@@ -18,6 +18,7 @@ is explicitly configured.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -171,6 +172,10 @@ def get_db():
     if USE_POSTGRES:
         if pg_pool is None:
             raise RuntimeError("PostgreSQL connection pool is not initialized")
+        try:
+            pg_pool.open()
+        except Exception:
+            pass
         with pg_pool.connection() as conn:
             yield conn
     else:
@@ -613,8 +618,102 @@ def init_database() -> None:
         )
 
         # ----------------------------------------------------------------
+        # Customer Organization Activation Tokens (bootstrap trust anchor)
+        # ----------------------------------------------------------------
+        db_execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS organization_activation_tokens (
+                token_id TEXT,
+                token_hash TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                organization_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                revoked_at TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                usage_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT
+            )
+            """,
+        )
+
+        ensure_column(conn, "organization_activation_tokens", "token_id", "TEXT")
+
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_org_tokens_org_id
+            ON organization_activation_tokens(organization_id)
+            """,
+        )
+
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_org_tokens_token_id
+            ON organization_activation_tokens(token_id)
+            """,
+        )
+
+        # ----------------------------------------------------------------
+        # Workstation Pairing Codes (ephemeral first-time onboarding claims)
+        # ----------------------------------------------------------------
+        db_execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS workstation_pairing_codes (
+                pairing_code TEXT PRIMARY KEY,
+                pairing_code_hash TEXT,
+                poll_token_hash TEXT,
+                machine_id TEXT NOT NULL,
+                machine_name TEXT,
+                organization_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                consumed_by_user_id TEXT,
+                provisioned_api_key TEXT,
+                FOREIGN KEY(consumed_by_user_id)
+                    REFERENCES users(user_id)
+                    ON DELETE SET NULL
+            )
+            """,
+        )
+
+        ensure_column(conn, "workstation_pairing_codes", "pairing_code_hash", "TEXT")
+        ensure_column(conn, "workstation_pairing_codes", "poll_token_hash", "TEXT")
+        ensure_column(conn, "workstation_pairing_codes", "machine_name", "TEXT")
+        ensure_column(conn, "workstation_pairing_codes", "organization_id", "TEXT")
+        ensure_column(conn, "workstation_pairing_codes", "provisioned_api_key", "TEXT")
+
+        # ----------------------------------------------------------------
         # Indexes
         # ----------------------------------------------------------------
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_pairing_codes_machine_id
+            ON workstation_pairing_codes(machine_id)
+            """,
+        )
+
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_pairing_codes_poll_token
+            ON workstation_pairing_codes(poll_token_hash)
+            """,
+        )
+
+        db_execute(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_pairing_codes_expires_at
+            ON workstation_pairing_codes(expires_at)
+            """,
+        )
+
         db_execute(
             conn,
             """
@@ -1004,64 +1103,6 @@ def create_access_token(user_id: str) -> tuple[str, int]:
     return token, int(expires_delta.total_seconds())
 
 
-def verify_user_workstation_entitlement(conn, user_id: str) -> None:
-    """
-    Data-driven Moldflow network license entitlement check.
-
-    Confirms that the authenticated user has at least one enabled
-    mobile_user_machine_access record whose machine_id maps to a
-    registered Moldflow FlexNet license server carrying at least one
-    PACKAGE-type feature with total_issued > 0.
-
-    Entitlement chain:
-      mobile_user_machine_access (enabled = 1)
-      -> machines              (registered workstation)
-      -> license_servers       (is_active, hostname matches machine_id)
-      -> license_server_features (total_issued > 0)
-      -> license_feature_catalog (feature_type = 'PACKAGE')
-
-    Deliberately does NOT require:
-      - license_active_checkouts  (transient: empty when no one is logged in)
-      - license_servers.status = 'UP'  (transient: server may be polled offline)
-      - available seats > 0       (transient: all seats may be checked out)
-
-    No user IDs or machine IDs are hard-coded.
-    """
-    entitled = db_execute(
-        conn,
-        """
-        SELECT 1
-        FROM mobile_user_machine_access muma
-        JOIN machines m
-            ON LOWER(m.machine_id) = LOWER(muma.machine_id)
-        JOIN license_servers ls
-            ON LOWER(ls.hostname) = LOWER(muma.machine_id)
-        JOIN license_server_features lsf
-            ON lsf.server_id = ls.server_id
-        JOIN license_feature_catalog lfc
-            ON lfc.feature_code = lsf.feature_code
-        WHERE muma.user_id = ?
-          AND muma.enabled = 1
-          AND ls.is_active = TRUE
-          AND lfc.feature_type = 'PACKAGE'
-          AND lsf.total_issued > 0
-        LIMIT 1
-        """,
-        (user_id,),
-    ).fetchone()
-
-    if entitled is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "No Moldflow license entitlement found for this account. "
-                "A valid, administrator-provisioned Moldflow workstation with "
-                "an active network license is required. "
-                "Please contact your administrator."
-            ),
-        )
-
-
 def get_mobile_user(
     credentials: HTTPAuthorizationCredentials | None =
     Depends(bearer_scheme),
@@ -1117,6 +1158,69 @@ def get_mobile_user(
             )
 
         return dict(row)
+
+
+# ============================================================================
+# Moldflow entitlement check
+# ============================================================================
+
+def check_moldflow_entitlement(user_id: str, conn) -> None:
+    """
+    Verifies that the authenticated user has a valid Moldflow network
+    license entitlement before a JWT is issued.
+
+    Entitlement chain (all conditions must be met):
+      mobile_user_machine_access (enabled=1)
+      → machines (registered workstation)
+      → license_servers (is_active, hostname matches machine_id)
+      → license_server_features (total_issued > 0)
+      → license_feature_catalog (feature_type = 'PACKAGE')
+
+    Deliberately does NOT require:
+      - license_active_checkouts (transient – 0 when no one is logged in)
+      - license_servers.status = 'UP'  (transient – server may be polled offline)
+      - available seats > 0  (transient – all seats could be checked out)
+
+    Raises HTTP 403 if the user has no entitled Moldflow workstation.
+    No user IDs are hard-coded; the check is data-driven for every user.
+    """
+    row = db_execute(
+        conn,
+        """
+        SELECT 1
+        FROM mobile_user_machine_access muma
+        JOIN machines m
+            ON LOWER(m.machine_id) = LOWER(muma.machine_id)
+        JOIN license_servers ls
+            ON LOWER(ls.hostname) = LOWER(muma.machine_id)
+        JOIN license_server_features lsf
+            ON lsf.server_id = ls.server_id
+        JOIN license_feature_catalog lfc
+            ON lfc.feature_code = lsf.feature_code
+        WHERE muma.user_id = ?
+          AND muma.enabled = 1
+          AND ls.is_active = TRUE
+          AND lfc.feature_type = 'PACKAGE'
+          AND lsf.total_issued > 0
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "No Moldflow license entitlement found for this account. "
+                "A valid, administrator-provisioned Moldflow workstation with "
+                "an active network license is required. "
+                "Please contact your administrator."
+            ),
+        )
+
+
+def verify_user_workstation_entitlement(conn, user_id: str) -> None:
+    return check_moldflow_entitlement(user_id, conn)
 
 
 # ============================================================================
@@ -1241,7 +1345,8 @@ def mobile_login(
                 detail="Invalid email or password",
             )
 
-        verify_user_workstation_entitlement(conn, row["user_id"])
+        # Entitlement gate: user must have a Moldflow-licensed workstation
+        check_moldflow_entitlement(row["user_id"], conn)
 
         token, expires_in = create_access_token(
             row["user_id"]
@@ -1266,14 +1371,23 @@ def mobile_login(
 AUTODESK_USERINFO_URL = "https://api.userprofile.autodesk.com/userinfo"
 
 
-@app.post("/auth/autodesk")
-def autodesk_login(
-    payload: AutodeskAuthRequest,
-) -> dict[str, Any]:
+def fetch_autodesk_userinfo(access_token: str) -> dict[str, Any]:
+    """
+    Validates an Autodesk access token by calling the Autodesk userinfo endpoint.
+    Returns the user profile claims dictionary or raises appropriate HTTP exceptions.
+    Does not log the access token.
+    """
+    token_str = (access_token or "").strip()
+    if not token_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Autodesk access token is required",
+        )
+
     req = urllib.request.Request(
         AUTODESK_USERINFO_URL,
         headers={
-            "Authorization": f"Bearer {payload.access_token}",
+            "Authorization": f"Bearer {token_str}",
             "User-Agent": "MoldflowMobile-Backend/1.0",
         },
     )
@@ -1310,7 +1424,87 @@ def autodesk_login(
             detail="Invalid or missing subject claim in Autodesk profile",
         )
 
-    _sub = str(autodesk_sub).strip()
+    return userinfo
+
+
+def resolve_or_create_autodesk_user(conn, userinfo: dict[str, Any]) -> str:
+    """
+    Resolves or provisions an internal users record from a verified Autodesk profile.
+    Uses sub, email, and display name.
+    Does NOT use email matching as workstation authorization.
+    """
+    sub = str(userinfo.get("sub") or "").strip()
+    if not sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing subject claim in Autodesk profile",
+        )
+
+    # 1. Check if user already exists by autodesk_id
+    row = db_execute(
+        conn,
+        "SELECT user_id, display_name, email FROM users WHERE autodesk_id = ?",
+        (sub,),
+    ).fetchone()
+
+    if row is not None:
+        return str(row["user_id"])
+
+    email = str(userinfo.get("email") or "").strip()
+    display_name = (
+        str(userinfo.get("name") or "").strip()
+        or str(userinfo.get("preferred_username") or "").strip()
+        or f"{userinfo.get('given_name', '')} {userinfo.get('family_name', '')}".strip()
+        or (email.split("@")[0] if email else "")
+        or f"Autodesk User {sub[:8]}"
+    )
+
+    # 2. Check if an existing user row matches by email to link their autodesk_id
+    if email:
+        row_email = db_execute(
+            conn,
+            "SELECT user_id FROM users WHERE lower(email) = lower(?)",
+            (email,),
+        ).fetchone()
+        if row_email is not None:
+            user_id = str(row_email["user_id"])
+            db_execute(
+                conn,
+                "UPDATE users SET autodesk_id = ? WHERE user_id = ?",
+                (sub, user_id),
+            )
+            return user_id
+
+    # 3. Create a new user row
+    clean_sub = re.sub(r"[^a-zA-Z0-9_\-]", "", sub)[:20]
+    user_id = f"ADSK-{clean_sub}" if clean_sub else f"ADSK-{secrets.token_hex(6)}"
+
+    col = db_execute(
+        conn,
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if col is not None:
+        user_id = f"{user_id}-{secrets.token_hex(4)}"
+
+    now = now_utc()
+    db_execute(
+        conn,
+        """
+        INSERT INTO users (user_id, display_name, email, autodesk_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, display_name, email, sub, now),
+    )
+    return user_id
+
+
+@app.post("/auth/autodesk")
+def autodesk_login(
+    payload: AutodeskAuthRequest,
+) -> dict[str, Any]:
+    userinfo = fetch_autodesk_userinfo(payload.access_token)
+    _sub = str(userinfo.get("sub")).strip()
 
     with get_db() as conn:
         row = db_execute(
@@ -1332,7 +1526,8 @@ def autodesk_login(
                 detail="Autodesk account is not provisioned for Moldflow Mobile access. Please contact your administrator.",
             )
 
-        verify_user_workstation_entitlement(conn, row["user_id"])
+        # Entitlement gate: user must have a Moldflow-licensed workstation
+        check_moldflow_entitlement(row["user_id"], conn)
 
         token, expires_in = create_access_token(
             row["user_id"]
@@ -2122,7 +2317,6 @@ def cancel_job(
                 detail="Job not found",
             )
 
-        # Owner-only: machine access grants read visibility, not control of the job.
         if row["user_id"] != authenticated_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2272,7 +2466,6 @@ def archive_job(
                 detail="Job not found",
             )
 
-        # Owner-only: machine access grants read visibility, not control of the job.
         if row["user_id"] != authenticated_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2636,8 +2829,14 @@ def enroll_workstation_endpoint(
                 detail=f"User '{payload.user_id}' does not exist",
             )
 
-        # If authenticated via one-time token, consume it
+        # If authenticated via one-time token, verify user binding and consume
         if _auth.get("auth_type") == "one_time_token":
+            bound_user = _auth.get("bound_user_id")
+            if bound_user and bound_user != payload.user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Enrollment token is bound to user '{bound_user}', but request specified '{payload.user_id}'",
+                )
             res = db_execute(
                 conn,
                 """
@@ -2894,4 +3093,647 @@ def register_client_internal(
         "api_key": payload.api_key[:6] + "..." + payload.api_key[-4:],
         "user_id": payload.user_id,
         "machine_id": payload.machine_id,
+    }
+
+
+# ============================================================================
+# Workstation Pairing API (Customer Onboarding & Activation)
+# ============================================================================
+
+def hash_token(token: str) -> str:
+    """Computes standard hex SHA-256 digest of a token/code."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def create_organization_activation_token(
+    organization_id: str,
+    organization_name: str,
+    expires_in_days: int | None = 365,
+    token_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Generates a cryptographically random, high-entropy organization activation token (MF-ORG-...).
+    Stores ONLY the SHA-256 hash in the database.
+    Returns the plaintext token once to the caller.
+    """
+    raw_entropy = secrets.token_hex(16).upper()
+    plaintext_token = f"MF-ORG-{raw_entropy}"
+    token_h = hash_token(plaintext_token)
+    tok_id = (token_id or "").strip() or f"OTOK-{secrets.token_hex(6).upper()}"
+    now = now_utc()
+    expires_at = (
+        (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).isoformat()
+        if expires_in_days
+        else None
+    )
+
+    with get_db() as conn:
+        db_execute(
+            conn,
+            """
+            INSERT INTO organization_activation_tokens (
+                token_id,
+                token_hash,
+                organization_id,
+                organization_name,
+                created_at,
+                expires_at,
+                revoked_at,
+                enabled,
+                usage_count,
+                last_used_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, 1, 0, NULL)
+            """,
+            (tok_id, token_h, organization_id.strip(), organization_name.strip(), now, expires_at),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "token_id": tok_id,
+        "organization_id": organization_id,
+        "organization_name": organization_name,
+        "activation_token": plaintext_token,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+
+
+def revoke_organization_activation_token(token_hash_or_plaintext: str) -> bool:
+    """Revokes an organization activation token by token_id, hash, or plaintext."""
+    t = token_hash_or_plaintext.strip()
+    is_hash = len(t) == 64 and all(c in "0123456789abcdefABCDEF" for c in t)
+    is_token_id = t.startswith("OTOK-")
+    h = t if is_hash else hash_token(t)
+    now = now_utc()
+    with get_db() as conn:
+        if is_token_id:
+            res = db_execute(
+                conn,
+                """
+                UPDATE organization_activation_tokens
+                SET enabled = 0, revoked_at = ?
+                WHERE token_id = ? AND revoked_at IS NULL
+                """,
+                (now, t),
+            )
+        else:
+            res = db_execute(
+                conn,
+                """
+                UPDATE organization_activation_tokens
+                SET enabled = 0, revoked_at = ?
+                WHERE token_hash = ? AND revoked_at IS NULL
+                """,
+                (now, h),
+            )
+        conn.commit()
+        return getattr(res, "rowcount", 0) > 0
+
+
+class BootstrapPairingRequest(BaseModel):
+    activation_token: str = Field(min_length=8, max_length=128)
+    machine_id: str = Field(min_length=1, max_length=128)
+    machine_name: str | None = Field(default=None, max_length=128)
+    pairing_code_hash: str = Field(min_length=64, max_length=64)
+    poll_token_hash: str = Field(min_length=64, max_length=64)
+    expires_in_seconds: int = Field(default=900, ge=60, le=900)
+
+
+@app.post("/api/workstation/bootstrap-pairing")
+def workstation_bootstrap_pairing(
+    payload: BootstrapPairingRequest,
+) -> dict[str, Any]:
+    """
+    Endpoint for a fresh workstation to establish an ephemeral pairing session
+    using an organization activation token.
+    Validates token hash, enforces anti-overwrite protection, and stores session hashes.
+    NEVER returns plaintext pairing_code or poll_token.
+    """
+    now = now_utc()
+    token_h = hash_token(payload.activation_token)
+    machine_id = payload.machine_id.strip()
+    m_name = (payload.machine_name or "").strip() or f"Workstation {machine_id}"
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=payload.expires_in_seconds)).isoformat()
+
+    with get_db() as conn:
+        # 1. Validate organization activation token
+        tok_row = db_execute(
+            conn,
+            """
+            SELECT organization_id, organization_name, expires_at, revoked_at, enabled
+            FROM organization_activation_tokens
+            WHERE token_hash = ?
+            """,
+            (token_h,),
+        ).fetchone()
+
+        if tok_row is None or tok_row["enabled"] != 1 or tok_row["revoked_at"] is not None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid, expired, or revoked organization activation token",
+            )
+
+        if tok_row["expires_at"] and tok_row["expires_at"] <= now:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Organization activation token has expired",
+            )
+
+        org_id = tok_row["organization_id"]
+
+        # 2. Anti-overwrite rate-limiting protection
+        recent = db_execute(
+            conn,
+            """
+            SELECT created_at, expires_at
+            FROM workstation_pairing_codes
+            WHERE machine_id = ?
+              AND consumed_at IS NULL
+              AND expires_at > ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (machine_id, now),
+        ).fetchone()
+
+        if recent is not None:
+            try:
+                c_time = datetime.fromisoformat(recent["created_at"])
+                if c_time.tzinfo is None:
+                    c_time = c_time.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - c_time).total_seconds() < 60:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="An active pairing session already exists for this workstation. Please wait before requesting another.",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
+        # 3. Invalidate older unconsumed sessions for this machine
+        db_execute(
+            conn,
+            """
+            UPDATE workstation_pairing_codes
+            SET consumed_at = ?
+            WHERE machine_id = ? AND consumed_at IS NULL
+            """,
+            (now, machine_id),
+        )
+
+        # 4. Increment usage count and update last_used_at
+        db_execute(
+            conn,
+            """
+            UPDATE organization_activation_tokens
+            SET usage_count = usage_count + 1, last_used_at = ?
+            WHERE token_hash = ?
+            """,
+            (now, token_h),
+        )
+
+        # 5. Insert new pairing record with hashes
+        db_execute(
+            conn,
+            """
+            INSERT INTO workstation_pairing_codes (
+                pairing_code,
+                pairing_code_hash,
+                poll_token_hash,
+                machine_id,
+                machine_name,
+                organization_id,
+                created_at,
+                expires_at,
+                consumed_at,
+                consumed_by_user_id,
+                provisioned_api_key
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+            ON CONFLICT (pairing_code)
+            DO UPDATE SET
+                pairing_code_hash = excluded.pairing_code_hash,
+                poll_token_hash = excluded.poll_token_hash,
+                machine_id = excluded.machine_id,
+                machine_name = excluded.machine_name,
+                organization_id = excluded.organization_id,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                consumed_at = NULL,
+                consumed_by_user_id = NULL,
+                provisioned_api_key = NULL
+            """,
+            (
+                payload.pairing_code_hash,
+                payload.pairing_code_hash,
+                payload.poll_token_hash,
+                machine_id,
+                m_name,
+                org_id,
+                now,
+                expires_at,
+            ),
+        )
+        conn.commit()
+
+    return {
+        "status": "pending",
+        "machine_id": machine_id,
+        "expires_at": expires_at,
+        "expires_in_seconds": payload.expires_in_seconds,
+    }
+
+
+@app.post("/api/workstation/pairing-code")
+def workstation_request_pairing_code(
+    identity: dict[str, Any] = Depends(get_moldflow_identity),
+) -> dict[str, Any]:
+    """
+    Protected endpoint for an already enrolled, active workstation to request a short-lived
+    high-entropy pairing code for mobile onboarding.
+    Authenticates via the existing workstation mechanism (X-Api-Key).
+    """
+    machine_id = identity["machine_id"]
+    now = now_utc()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+
+    code_entropy = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
+    pairing_code = f"MF-{code_entropy}"
+    code_h = hash_token(pairing_code)
+
+    with get_db() as conn:
+        m_row = db_execute(
+            conn,
+            "SELECT machine_id, machine_name FROM machines WHERE machine_id = ?",
+            (machine_id,),
+        ).fetchone()
+        if m_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Workstation '{machine_id}' is not enrolled",
+            )
+        m_name = m_row["machine_name"] if m_row else f"Workstation {machine_id}"
+
+        db_execute(
+            conn,
+            """
+            UPDATE workstation_pairing_codes
+            SET consumed_at = ?
+            WHERE machine_id = ? AND consumed_at IS NULL
+            """,
+            (now, machine_id),
+        )
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO workstation_pairing_codes (
+                pairing_code,
+                pairing_code_hash,
+                poll_token_hash,
+                machine_id,
+                machine_name,
+                organization_id,
+                created_at,
+                expires_at,
+                consumed_at,
+                consumed_by_user_id,
+                provisioned_api_key
+            )
+            VALUES (?, ?, NULL, ?, ?, NULL, ?, ?, NULL, NULL, NULL)
+            """,
+            (pairing_code, code_h, machine_id, m_name, now, expires_at),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "pairing_code": pairing_code,
+        "machine_id": machine_id,
+        "created_at": now,
+        "expires_at": expires_at,
+        "expires_in_seconds": 900,
+    }
+
+
+class PairWorkstationRequest(BaseModel):
+    pairing_code: str = Field(min_length=1, max_length=64)
+    autodesk_access_token: str | None = Field(default=None, max_length=2048)
+
+
+def execute_workstation_pairing(
+    conn,
+    user_id: str,
+    pairing_code: str,
+) -> dict[str, Any]:
+    """
+    Centralized transaction helper to claim an enrolled/bootstrap workstation
+    using a physical pairing code.
+    Atomically binds workstation to user, updates mobile_user_machine_access,
+    enforces Moldflow license entitlement, provisions workstation API key if bootstrap,
+    and returns production mobile JWT.
+    Rolls back completely if entitlement check fails.
+    """
+    code = pairing_code.strip()
+    code_h = hash_token(code)
+    now = now_utc()
+
+    row = db_execute(
+        conn,
+        """
+        SELECT pairing_code, pairing_code_hash, poll_token_hash, organization_id,
+               machine_id, machine_name, expires_at, consumed_at, provisioned_api_key
+        FROM workstation_pairing_codes
+        WHERE pairing_code_hash = ? OR pairing_code = ?
+        """,
+        (code_h, code),
+    ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pairing code not found",
+        )
+
+    is_bootstrap = bool(row["poll_token_hash"] or row["organization_id"])
+
+    if row["consumed_at"] is not None:
+        if is_bootstrap and not row["provisioned_api_key"]:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Pairing session has already been completed and credentials retrieved",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pairing code has already been consumed",
+        )
+
+    if row["expires_at"] <= now:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Pairing code has expired",
+        )
+
+    machine_id = row["machine_id"]
+    m_name = row["machine_name"] or f"Workstation {machine_id}"
+
+    # If not a bootstrap session, verify machine exists in machines table
+    m_row = db_execute(
+        conn,
+        "SELECT machine_id FROM machines WHERE machine_id = ?",
+        (machine_id,),
+    ).fetchone()
+    if m_row is None and not is_bootstrap:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workstation '{machine_id}' is no longer registered",
+        )
+
+    # Atomic conditional update (race protection)
+    res = db_execute(
+        conn,
+        """
+        UPDATE workstation_pairing_codes
+        SET consumed_at = ?, consumed_by_user_id = ?
+        WHERE (pairing_code_hash = ? OR pairing_code = ?)
+          AND consumed_at IS NULL
+          AND expires_at > ?
+        """,
+        (now, user_id, code_h, code, now),
+    )
+
+    rowcount = getattr(res, "rowcount", None)
+    if rowcount is not None and rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pairing code was consumed concurrently or has expired",
+        )
+
+    # Upsert machines record for this machine
+    db_execute(
+        conn,
+        """
+        INSERT INTO machines (machine_id, user_id, machine_name, created_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (machine_id)
+        DO UPDATE SET machine_name = excluded.machine_name, last_seen_at = excluded.last_seen_at
+        """,
+        (machine_id, user_id, m_name, now, now),
+    )
+
+    # Upsert mobile_user_machine_access
+    db_execute(
+        conn,
+        """
+        INSERT INTO mobile_user_machine_access (user_id, machine_id, created_at, enabled)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT (user_id, machine_id)
+        DO UPDATE SET enabled = 1
+        """,
+        (user_id, machine_id, now),
+    )
+
+    # Enforce data-driven Moldflow network license entitlement check
+    try:
+        verify_user_workstation_entitlement(conn, user_id)
+    except HTTPException:
+        # Entitlement check failed: roll back entire transaction so no claim or access remains!
+        conn.rollback()
+        raise
+
+    if is_bootstrap:
+        # Generate permanent workstation API key for fresh workstation
+        clean_machine = re.sub(r"[^a-zA-Z0-9_\-]", "", machine_id)[:32] or "workstation"
+        entropy = secrets.token_hex(32)
+        generated_api_key = f"mf-client-{clean_machine}-{entropy}"
+
+        # Rotate previous keys and insert new active key
+        db_execute(
+            conn,
+            "UPDATE api_clients SET enabled = 0 WHERE machine_id = ?",
+            (machine_id,),
+        )
+        db_execute(
+            conn,
+            """
+            INSERT INTO api_clients (
+                api_key,
+                user_id,
+                machine_id,
+                enabled,
+                created_at
+            )
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (generated_api_key, user_id, machine_id, now),
+        )
+
+        # Store provisioned_api_key for one-time retrieval by workstation poll
+        db_execute(
+            conn,
+            """
+            UPDATE workstation_pairing_codes
+            SET provisioned_api_key = ?
+            WHERE (pairing_code_hash = ? OR pairing_code = ?)
+            """,
+            (generated_api_key, code_h, code),
+        )
+
+    conn.commit()
+
+    token, expires_in = create_access_token(user_id)
+
+    return {
+        "status": "paired",
+        "user_id": user_id,
+        "machine_id": machine_id,
+        "access": "enabled",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+    }
+
+
+@app.post("/api/mobile/pair-workstation")
+def mobile_pair_workstation(
+    payload: PairWorkstationRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    x_autodesk_token: str | None = Header(default=None, alias="X-Autodesk-Token"),
+) -> dict[str, Any]:
+    """
+    Claim an enrolled/bootstrap workstation using the physical pairing code.
+    Supports two authentication modes:
+    A. Existing mobile JWT (Bearer token in Authorization header)
+    B. First-time Autodesk access-token onboarding (autodesk_access_token in payload or header)
+    Centralizes the actual pairing transaction in execute_workstation_pairing.
+    """
+    code = payload.pairing_code.strip()
+    if not code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pairing code is required",
+        )
+
+    user_id: str | None = None
+    autodesk_userinfo: dict[str, Any] | None = None
+
+    # Mode A: Authenticate with existing mobile JWT
+    if credentials is not None and credentials.credentials:
+        try:
+            jwt_payload = jwt.decode(
+                credentials.credentials,
+                JWT_SECRET_KEY,
+                algorithms=[JWT_ALGORITHM],
+            )
+            jwt_user_id = jwt_payload.get("sub")
+            if not jwt_user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid access token",
+                )
+        except InvalidTokenError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired access token",
+            )
+
+        with get_db() as conn:
+            user_row = db_execute(
+                conn,
+                "SELECT user_id FROM users WHERE user_id = ?",
+                (jwt_user_id,),
+            ).fetchone()
+            if user_row is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="User no longer exists",
+                )
+            user_id = str(user_row["user_id"])
+
+    # Mode B: First-time onboarding with Autodesk access token
+    adsk_token = (payload.autodesk_access_token or "").strip() or (x_autodesk_token or "").strip()
+    if not user_id and adsk_token:
+        autodesk_userinfo = fetch_autodesk_userinfo(adsk_token)
+
+    if not user_id and not autodesk_userinfo:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: provide Bearer JWT or Autodesk access token",
+        )
+
+    with get_db() as conn:
+        if user_id is None and autodesk_userinfo is not None:
+            user_id = resolve_or_create_autodesk_user(conn, autodesk_userinfo)
+
+        return execute_workstation_pairing(conn, user_id, code)
+
+
+class PollPairingRequest(BaseModel):
+    poll_token: str = Field(min_length=16, max_length=128)
+
+
+@app.post("/api/workstation/poll-pairing")
+def workstation_poll_pairing(
+    payload: PollPairingRequest,
+) -> dict[str, Any]:
+    """
+    Protected polling endpoint for a fresh workstation to pick up its provisioned permanent
+    API key once mobile pairing succeeds.
+    Authenticates strictly by verifying possession of the original plaintext poll_token.
+    Delivers the API key exactly once and clears it immediately from database (single-use retrieval).
+    """
+    token_h = hash_token(payload.poll_token)
+    now = now_utc()
+
+    with get_db() as conn:
+        row = db_execute(
+            conn,
+            """
+            SELECT machine_id, expires_at, consumed_at, consumed_by_user_id, provisioned_api_key
+            FROM workstation_pairing_codes
+            WHERE poll_token_hash = ?
+            """,
+            (token_h,),
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invalid poll token",
+            )
+
+        if row["consumed_at"] is None:
+            if row["expires_at"] <= now:
+                return {"status": "expired", "machine_id": row["machine_id"]}
+            return {"status": "pending", "machine_id": row["machine_id"]}
+
+        # Pairing has been consumed
+        api_key = row["provisioned_api_key"]
+        if not api_key:
+            # Replay protection: Key has already been retrieved
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Provisioned API key has already been retrieved",
+            )
+
+        # Clear provisioned_api_key immediately in the same transaction
+        db_execute(
+            conn,
+            """
+            UPDATE workstation_pairing_codes
+            SET provisioned_api_key = NULL
+            WHERE poll_token_hash = ?
+            """,
+            (token_h,),
+        )
+        conn.commit()
+
+    return {
+        "status": "paired",
+        "machine_id": row["machine_id"],
+        "api_key": api_key,
+        "user_id": row["consumed_by_user_id"],
     }

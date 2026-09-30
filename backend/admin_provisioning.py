@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import os
 import re
 import secrets
@@ -82,7 +83,7 @@ def resolve_db_target(explicit_target: str | None = None) -> tuple[str, bool]:
         return target, is_pg
 
     # Check common .env locations if not already set in environment
-    if not os.getenv("DATABASE_URL") and not os.getenv("SUPABASE_DATABASE_URL"):
+    if "DATABASE_URL" not in os.environ and "SUPABASE_DATABASE_URL" not in os.environ:
         candidates = [
             BASE_DIR / ".env",
             Path("C:/MF/MoldflowSynergyPlugin/mobile_backend/.env"),
@@ -91,7 +92,7 @@ def resolve_db_target(explicit_target: str | None = None) -> tuple[str, bool]:
         for c in candidates:
             load_env_file(c)
 
-    url = os.getenv("SUPABASE_DATABASE_URL", "").strip() or os.getenv("DATABASE_URL", "").strip()
+    url = os.getenv("DATABASE_URL", "").strip() or os.getenv("SUPABASE_DATABASE_URL", "").strip()
     if url and (url.startswith("postgresql://") or url.startswith("postgres://")):
         return url, True
 
@@ -586,6 +587,240 @@ def link_autodesk_identity(
 
 
 # ============================================================================
+# Organization Activation Token Management (IT / Admins)
+# ============================================================================
+
+def hash_token(token: str) -> str:
+    """Computes standard hex SHA-256 digest of an activation token."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def create_organization_token(
+    organization_id: str,
+    organization_name: str,
+    expires_in_days: int | None = 365,
+    token_id: str | None = None,
+    db_target: str | None = None,
+) -> dict[str, Any]:
+    """
+    Creates an organization activation token for secure first-time workstation bootstrapping.
+    Enforces:
+    - Non-empty organization ID and name.
+    - Cryptographically secure high-entropy token generation (MF-ORG-<32 hex chars>).
+    - Safe public token_id generation (OTOK-<12 hex chars>).
+    - Only SHA-256 hash is stored in the database.
+    - Plaintext token returned exactly once in the return dictionary; never stored or logged.
+    """
+    clean_org_id = organization_id.strip()
+    clean_org_name = organization_name.strip()
+
+    if not clean_org_id:
+        raise ValueError("organization_id cannot be empty")
+    if not clean_org_name:
+        raise ValueError("organization_name cannot be empty")
+    if expires_in_days is not None and expires_in_days <= 0:
+        raise ValueError("expires_in_days must be a positive integer or None")
+
+    tok_id = (token_id or "").strip() or f"OTOK-{secrets.token_hex(6).upper()}"
+    raw_entropy = secrets.token_hex(16).upper()
+    plaintext_token = f"MF-ORG-{raw_entropy}"
+    token_h = hash_token(plaintext_token)
+    created_at = now_utc()
+    expires_at = (
+        (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).isoformat()
+        if expires_in_days is not None
+        else None
+    )
+
+    with get_db_connection(db_target) as conn:
+        # Check duplicate token_id collision
+        existing_id = db_execute(
+            conn,
+            "SELECT token_id FROM organization_activation_tokens WHERE token_id = ?",
+            (tok_id,),
+        ).fetchone()
+        if existing_id is not None:
+            raise ValueError(f"Organization token with token_id '{tok_id}' already exists")
+
+        # Check hash collision defensively
+        existing_hash = db_execute(
+            conn,
+            "SELECT organization_id FROM organization_activation_tokens WHERE token_hash = ?",
+            (token_h,),
+        ).fetchone()
+        if existing_hash is not None:
+            raise ValueError("Token hash collision detected; please try again")
+
+        db_execute(
+            conn,
+            """
+            INSERT INTO organization_activation_tokens (
+                token_id,
+                token_hash,
+                organization_id,
+                organization_name,
+                created_at,
+                expires_at,
+                revoked_at,
+                enabled,
+                usage_count,
+                last_used_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, 1, 0, NULL)
+            """,
+            (tok_id, token_h, clean_org_id, clean_org_name, created_at, expires_at),
+        )
+
+    return {
+        "status": "success",
+        "token_id": tok_id,
+        "organization_id": clean_org_id,
+        "organization_name": clean_org_name,
+        "activation_token": plaintext_token,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+
+
+def list_organization_tokens(
+    organization_id: str | None = None,
+    db_target: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Lists organization activation tokens with safe metadata only.
+    NEVER queries, exposes, or returns token_hash.
+    """
+    now = now_utc()
+    sql = """
+        SELECT
+            token_id,
+            organization_id,
+            organization_name,
+            enabled,
+            created_at,
+            expires_at,
+            revoked_at,
+            last_used_at,
+            usage_count
+        FROM organization_activation_tokens
+    """
+    params: list[Any] = []
+    if organization_id and organization_id.strip():
+        sql += " WHERE organization_id = ?"
+        params.append(organization_id.strip())
+    sql += " ORDER BY created_at DESC"
+
+    with get_db_connection(db_target) as conn:
+        rows = db_execute(conn, sql, params).fetchall()
+        result = []
+        for r in rows:
+            item = dict(r)
+            item["use_count"] = item.get("usage_count", 0)
+            if item.get("revoked_at") or item.get("enabled") == 0:
+                item["state"] = "REVOKED"
+            elif item.get("expires_at") and item["expires_at"] < now:
+                item["state"] = "EXPIRED"
+            else:
+                item["state"] = "ACTIVE"
+            item.pop("token_hash", None)
+            result.append(item)
+        return result
+
+
+def revoke_organization_token(
+    token_id: str | None = None,
+    token: str | None = None,
+    db_target: str | None = None,
+) -> dict[str, Any]:
+    """
+    Revokes an organization activation token idempotently.
+    Accepts token_id OR plaintext activation token.
+    If plaintext token is supplied, it is hashed immediately; plaintext is NEVER printed or logged.
+    """
+    clean_token_id = (token_id or "").strip()
+    clean_token = (token or "").strip()
+
+    if not clean_token_id and not clean_token:
+        raise ValueError("Must provide either --token-id or --token to revoke an organization token")
+
+    token_h = hash_token(clean_token) if clean_token else None
+    now = now_utc()
+
+    with get_db_connection(db_target) as conn:
+        if clean_token_id:
+            row = db_execute(
+                conn,
+                """
+                SELECT token_id, organization_id, organization_name, enabled, revoked_at
+                FROM organization_activation_tokens
+                WHERE token_id = ?
+                """,
+                (clean_token_id,),
+            ).fetchone()
+        else:
+            row = db_execute(
+                conn,
+                """
+                SELECT token_id, organization_id, organization_name, enabled, revoked_at
+                FROM organization_activation_tokens
+                WHERE token_hash = ?
+                """,
+                (token_h,),
+            ).fetchone()
+
+        if row is None:
+            raise ValueError("Organization token not found")
+
+        matched_token_id = row["token_id"] or "(unknown)"
+        org_id = row["organization_id"]
+        org_name = row["organization_name"]
+
+        # Check if already revoked (idempotent)
+        if row["enabled"] == 0 or row["revoked_at"] is not None:
+            return {
+                "status": "success",
+                "revoked": False,
+                "already_revoked": True,
+                "token_id": matched_token_id,
+                "organization_id": org_id,
+                "organization_name": org_name,
+                "revoked_at": row["revoked_at"],
+            }
+
+        # Perform atomic revocation
+        if clean_token_id:
+            db_execute(
+                conn,
+                """
+                UPDATE organization_activation_tokens
+                SET enabled = 0, revoked_at = ?
+                WHERE token_id = ? AND revoked_at IS NULL
+                """,
+                (now, clean_token_id),
+            )
+        else:
+            db_execute(
+                conn,
+                """
+                UPDATE organization_activation_tokens
+                SET enabled = 0, revoked_at = ?
+                WHERE token_hash = ? AND revoked_at IS NULL
+                """,
+                (now, token_h),
+            )
+
+    return {
+        "status": "success",
+        "revoked": True,
+        "already_revoked": False,
+        "token_id": matched_token_id,
+        "organization_id": org_id,
+        "organization_name": org_name,
+        "revoked_at": now,
+    }
+
+
+# ============================================================================
 # CLI Entrypoint
 # ============================================================================
 
@@ -654,6 +889,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_link.add_argument("--user", required=True, help="Target user ID or email address")
     p_link.add_argument("--sub", required=True, help="Autodesk OAuth subject identifier (sub)")
+
+    # 10. create-organization-token
+    p_cot = subparsers.add_parser("create-organization-token", help="Generate an organization activation token (MF-ORG-...)")
+    p_cot.add_argument("--org-id", "--organization-id", dest="org_id", required=True, help="Organization ID (e.g., ORG-ACME)")
+    p_cot.add_argument("--org-name", "--organization-name", dest="org_name", required=True, help="Organization display name (e.g., 'ACME Corp')")
+    p_cot.add_argument("--expires-days", type=int, default=365, help="Validity in days (default: 365, set 0 or negative for no expiration)")
+    p_cot.add_argument("--token-id", default=None, help="Optional custom token ID (generated if omitted)")
+    p_cot.add_argument("--out-token-file", default=None, help="Optional file path to securely save the token string")
+
+    # 7. list-organization-tokens
+    p_lot = subparsers.add_parser("list-organization-tokens", help="List organization activation tokens (safe metadata only)")
+    p_lot.add_argument("--org-id", "--organization-id", dest="org_id", default=None, help="Filter by organization ID")
+
+    # 8. revoke-organization-token
+    p_rot = subparsers.add_parser("revoke-organization-token", help="Revoke an organization activation token")
+    p_rot.add_argument("--token-id", default=None, help="Token ID to revoke (e.g., OTOK-XXXXXX)")
+    p_rot.add_argument("--token", "--activation-token", dest="token", default=None, help="Plaintext activation token to revoke (hashed immediately)")
 
     return parser
 
@@ -755,6 +1007,25 @@ def main() -> None:
             print("  2. Run Install-MoldflowWorkstation.ps1 with the enrollment token on the workstation.")
             print()
 
+        elif args.command == "list-users":
+            users = list_users(db_target=db_target)
+            print(f"\nRegistered Users ({len(users)}):")
+            print(f"{'User ID':<24} {'Email':<30} {'Display Name':<22} {'Machines':<10} {'Devices':<10}")
+            print("-" * 100)
+            for u in users:
+                print(f"{u['user_id']:<24} {u['email']:<30} {u['display_name']:<22} {u['machine_count']:<10} {u['device_count']:<10}")
+            print()
+
+        elif args.command == "list-tokens":
+            tokens = list_tokens(user_id=args.user_id, db_target=db_target)
+            print(f"\nEnrollment Tokens ({len(tokens)}):")
+            print(f"{'Token':<38} {'User ID':<22} {'State':<10} {'Expires At':<26} {'Machine'}")
+            print("-" * 115)
+            for t in tokens:
+                mach = t.get("consumed_by_machine_id") or "-"
+                print(f"{t['token']:<38} {t.get('user_id') or '-':<22} {t['state']:<10} {t['expires_at']:<26} {mach}")
+            print()
+
         elif args.command == "grant-machine-access":
             res = grant_machine_access(args.user_id, args.machine_id, db_target=db_target)
             print("\n[SUCCESS] Machine access granted:")
@@ -777,25 +1048,6 @@ def main() -> None:
                     print(f"{r['user_id']:<26} {(r.get('email') or '-'):<30} {r['machine_id']:<24} {'yes' if r['enabled'] else 'no':<8} {r['created_at']}")
                 print()
 
-        elif args.command == "list-users":
-            users = list_users(db_target=db_target)
-            print(f"\nRegistered Users ({len(users)}):")
-            print(f"{'User ID':<24} {'Email':<30} {'Display Name':<22} {'Machines':<10} {'Devices':<10}")
-            print("-" * 100)
-            for u in users:
-                print(f"{u['user_id']:<24} {u['email']:<30} {u['display_name']:<22} {u['machine_count']:<10} {u['device_count']:<10}")
-            print()
-
-        elif args.command == "list-tokens":
-            tokens = list_tokens(user_id=args.user_id, db_target=db_target)
-            print(f"\nEnrollment Tokens ({len(tokens)}):")
-            print(f"{'Token':<38} {'User ID':<22} {'State':<10} {'Expires At':<26} {'Machine'}")
-            print("-" * 115)
-            for t in tokens:
-                mach = t.get("consumed_by_machine_id") or "-"
-                print(f"{t['token']:<38} {t.get('user_id') or '-':<22} {t['state']:<10} {t['expires_at']:<26} {mach}")
-            print()
-
         elif args.command == "link-autodesk":
             res = link_autodesk_identity(
                 user_identifier=args.user,
@@ -813,6 +1065,56 @@ def main() -> None:
                 print(f"  User ID:      {res['user_id']}")
                 print(f"  Email:        {res['email']}")
                 print(f"  Autodesk Sub: {res['autodesk_sub']}\n")
+
+        elif args.command == "create-organization-token":
+            days = args.expires_days if args.expires_days > 0 else None
+            res = create_organization_token(
+                organization_id=args.org_id,
+                organization_name=args.org_name,
+                expires_in_days=days,
+                token_id=args.token_id,
+                db_target=db_target,
+            )
+            raw_token = res["activation_token"]
+            print("\n[SUCCESS] Organization activation token issued:")
+            print(f"  Token ID:          {res['token_id']}")
+            print(f"  Organization:      {res['organization_name']} ({res['organization_id']})")
+            print(f"  Activation Token:  {raw_token}")
+            print(f"  Expires At:        {res['expires_at'] or 'Never'}")
+            print("  IMPORTANT: Plaintext token is shown ONCE. Store it securely; only its hash is persisted.")
+
+            if args.out_token_file:
+                out_path = Path(args.out_token_file).resolve()
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(raw_token.strip())
+                print(f"  Token saved:       {out_path}")
+            print()
+
+        elif args.command == "list-organization-tokens":
+            tokens = list_organization_tokens(organization_id=args.org_id, db_target=db_target)
+            print(f"\nOrganization Activation Tokens ({len(tokens)}):")
+            print(f"{'Token ID':<18} {'Org ID':<16} {'Organization Name':<24} {'State':<10} {'Use Count':<10} {'Expires At':<26} {'Revoked At'}")
+            print("-" * 125)
+            for t in tokens:
+                rev = t.get("revoked_at") or "-"
+                exp = t.get("expires_at") or "Never"
+                print(f"{t.get('token_id') or '-':<18} {t['organization_id']:<16} {t['organization_name']:<24} {t['state']:<10} {t.get('use_count', 0):<10} {exp:<26} {rev}")
+            print()
+
+        elif args.command == "revoke-organization-token":
+            res = revoke_organization_token(
+                token_id=args.token_id,
+                token=args.token,
+                db_target=db_target,
+            )
+            if res.get("already_revoked"):
+                print("\n[NOTICE] Organization activation token was already revoked:")
+            else:
+                print("\n[SUCCESS] Organization activation token revoked:")
+            print(f"  Token ID:      {res['token_id']}")
+            print(f"  Organization:  {res['organization_name']} ({res['organization_id']})")
+            print(f"  Revoked At:    {res['revoked_at']}\n")
 
     except Exception as ex:
         print(f"\n[ERROR] {ex}\n", file=sys.stderr)
