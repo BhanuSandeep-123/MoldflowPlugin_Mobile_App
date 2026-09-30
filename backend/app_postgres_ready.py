@@ -1005,12 +1005,46 @@ def create_access_token(user_id: str) -> tuple[str, int]:
 
 
 def verify_user_workstation_entitlement(conn, user_id: str) -> None:
+    """
+    Data-driven Moldflow network license entitlement check.
+
+    Confirms that the authenticated user has at least one enabled
+    mobile_user_machine_access record whose machine_id maps to a
+    registered Moldflow FlexNet license server carrying at least one
+    PACKAGE-type feature with total_issued > 0.
+
+    Entitlement chain:
+      mobile_user_machine_access (enabled = 1)
+      -> machines              (registered workstation)
+      -> license_servers       (is_active, hostname matches machine_id)
+      -> license_server_features (total_issued > 0)
+      -> license_feature_catalog (feature_type = 'PACKAGE')
+
+    Deliberately does NOT require:
+      - license_active_checkouts  (transient: empty when no one is logged in)
+      - license_servers.status = 'UP'  (transient: server may be polled offline)
+      - available seats > 0       (transient: all seats may be checked out)
+
+    No user IDs or machine IDs are hard-coded.
+    """
     entitled = db_execute(
         conn,
         """
         SELECT 1
-        FROM mobile_user_machine_access
-        WHERE user_id = ? AND enabled = 1
+        FROM mobile_user_machine_access muma
+        JOIN machines m
+            ON LOWER(m.machine_id) = LOWER(muma.machine_id)
+        JOIN license_servers ls
+            ON LOWER(ls.hostname) = LOWER(muma.machine_id)
+        JOIN license_server_features lsf
+            ON lsf.server_id = ls.server_id
+        JOIN license_feature_catalog lfc
+            ON lfc.feature_code = lsf.feature_code
+        WHERE muma.user_id = ?
+          AND muma.enabled = 1
+          AND ls.is_active = TRUE
+          AND lfc.feature_type = 'PACKAGE'
+          AND lsf.total_issued > 0
         LIMIT 1
         """,
         (user_id,),
@@ -1019,7 +1053,12 @@ def verify_user_workstation_entitlement(conn, user_id: str) -> None:
     if entitled is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is not authorized for Moldflow Mobile: no enrolled workstation assigned. Please contact your administrator.",
+            detail=(
+                "No Moldflow license entitlement found for this account. "
+                "A valid, administrator-provisioned Moldflow workstation with "
+                "an active network license is required. "
+                "Please contact your administrator."
+            ),
         )
 
 
