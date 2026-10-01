@@ -3876,6 +3876,44 @@ def mobile_unpair_workstation(
         }
 
 
+@app.get("/api/mobile/workstations")
+def mobile_workstations(
+    user: dict[str, Any] = Depends(get_mobile_user),
+) -> list[dict[str, Any]]:
+    """
+    Returns only the authenticated user's currently enabled workstation associations.
+    - Uses mobile_user_machine_access (enabled = 1).
+    - Joins machines table to retrieve machine_name.
+    - Excludes other users' associations and disabled/unpaired workstations.
+    """
+    user_id = user["user_id"]
+    with get_db() as conn:
+        rows = db_execute(
+            conn,
+            """
+            SELECT
+                muma.machine_id,
+                COALESCE(NULLIF(m.machine_name, ''), muma.machine_id) AS machine_name,
+                muma.created_at AS paired_at
+            FROM mobile_user_machine_access muma
+            LEFT JOIN machines m ON LOWER(m.machine_id) = LOWER(muma.machine_id)
+            WHERE muma.user_id = ?
+              AND muma.enabled = 1
+            ORDER BY muma.created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            result.append({
+                "machine_id": row["machine_id"],
+                "machine_name": row["machine_name"],
+                "paired_at": row["paired_at"] if "paired_at" in row.keys() else None,
+            })
+        return result
+
+
 class PollPairingRequest(BaseModel):
     poll_token: str = Field(min_length=16, max_length=128)
 
