@@ -639,6 +639,7 @@ def init_database() -> None:
         )
 
         ensure_column(conn, "organization_activation_tokens", "token_id", "TEXT")
+        ensure_column(conn, "organization_activation_tokens", "max_usages", "INTEGER")
 
         db_execute(
             conn,
@@ -3110,43 +3111,79 @@ def create_organization_activation_token(
     organization_name: str,
     expires_in_days: int | None = 365,
     token_id: str | None = None,
+    max_usages: int | None = None,
+    expires_in_hours: int | None = None,
+    token_prefix: str = "MF-ORG",
 ) -> dict[str, Any]:
     """
     Generates a cryptographically random, high-entropy organization activation token (MF-ORG-...).
+    Supports single-use and short TTL enforcement via max_usages and expires_in_hours.
     Stores ONLY the SHA-256 hash in the database.
     Returns the plaintext token once to the caller.
     """
     raw_entropy = secrets.token_hex(16).upper()
-    plaintext_token = f"MF-ORG-{raw_entropy}"
+    prefix = token_prefix.strip().rstrip("-")
+    plaintext_token = f"{prefix}-{raw_entropy}"
     token_h = hash_token(plaintext_token)
     tok_id = (token_id or "").strip() or f"OTOK-{secrets.token_hex(6).upper()}"
     now = now_utc()
-    expires_at = (
-        (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).isoformat()
-        if expires_in_days
-        else None
-    )
+    if expires_in_hours is not None:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).isoformat()
+    elif expires_in_days is not None:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).isoformat()
+    else:
+        expires_at = None
 
     with get_db() as conn:
-        db_execute(
-            conn,
-            """
-            INSERT INTO organization_activation_tokens (
-                token_id,
-                token_hash,
-                organization_id,
-                organization_name,
-                created_at,
-                expires_at,
-                revoked_at,
-                enabled,
-                usage_count,
-                last_used_at
+        has_max_usages = False
+        try:
+            c_info = db_execute(conn, "PRAGMA table_info(organization_activation_tokens)").fetchall()
+            col_names = [col[1] if isinstance(col, (tuple, list)) else col["name"] for col in c_info]
+            has_max_usages = "max_usages" in col_names
+        except Exception:
+            pass
+
+        if has_max_usages and max_usages is not None:
+            db_execute(
+                conn,
+                """
+                INSERT INTO organization_activation_tokens (
+                    token_id,
+                    token_hash,
+                    organization_id,
+                    organization_name,
+                    created_at,
+                    expires_at,
+                    revoked_at,
+                    enabled,
+                    usage_count,
+                    last_used_at,
+                    max_usages
+                )
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 1, 0, NULL, ?)
+                """,
+                (tok_id, token_h, organization_id.strip(), organization_name.strip(), now, expires_at, max_usages),
             )
-            VALUES (?, ?, ?, ?, ?, ?, NULL, 1, 0, NULL)
-            """,
-            (tok_id, token_h, organization_id.strip(), organization_name.strip(), now, expires_at),
-        )
+        else:
+            db_execute(
+                conn,
+                """
+                INSERT INTO organization_activation_tokens (
+                    token_id,
+                    token_hash,
+                    organization_id,
+                    organization_name,
+                    created_at,
+                    expires_at,
+                    revoked_at,
+                    enabled,
+                    usage_count,
+                    last_used_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 1, 0, NULL)
+                """,
+                (tok_id, token_h, organization_id.strip(), organization_name.strip(), now, expires_at),
+            )
         conn.commit()
 
     return {
@@ -3157,6 +3194,7 @@ def create_organization_activation_token(
         "activation_token": plaintext_token,
         "created_at": now,
         "expires_at": expires_at,
+        "max_usages": max_usages,
     }
 
 
@@ -3218,30 +3256,78 @@ def workstation_bootstrap_pairing(
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=payload.expires_in_seconds)).isoformat()
 
     with get_db() as conn:
-        # 1. Validate organization activation token
-        tok_row = db_execute(
-            conn,
-            """
-            SELECT organization_id, organization_name, expires_at, revoked_at, enabled
-            FROM organization_activation_tokens
-            WHERE token_hash = ?
-            """,
-            (token_h,),
-        ).fetchone()
+        # 1. Validate bootstrap credential against organization_activation_tokens or enrollment_tokens
+        tok_row = None
+        try:
+            tok_row = db_execute(
+                conn,
+                """
+                SELECT organization_id, organization_name, expires_at, revoked_at, enabled, usage_count, max_usages
+                FROM organization_activation_tokens
+                WHERE token_hash = ?
+                """,
+                (token_h,),
+            ).fetchone()
+        except Exception:
+            tok_row = db_execute(
+                conn,
+                """
+                SELECT organization_id, organization_name, expires_at, revoked_at, enabled, usage_count
+                FROM organization_activation_tokens
+                WHERE token_hash = ?
+                """,
+                (token_h,),
+            ).fetchone()
 
-        if tok_row is None or tok_row["enabled"] != 1 or tok_row["revoked_at"] is not None:
+        is_enrollment_token = False
+        if tok_row is None and (payload.activation_token.startswith("mf-enroll-") or payload.activation_token.startswith("MF-BOOT-")):
+            e_row = db_execute(
+                conn,
+                "SELECT token, user_id, expires_at, consumed_at FROM enrollment_tokens WHERE token = ?",
+                (payload.activation_token,),
+            ).fetchone()
+            if e_row is not None:
+                if e_row["consumed_at"] is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Enrollment token has already been consumed (single-use)",
+                    )
+                if e_row["expires_at"] <= now:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Enrollment token has expired",
+                    )
+                is_enrollment_token = True
+                org_id = "ORG-ENROLLMENT"
+
+        if tok_row is None and not is_enrollment_token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid, expired, or revoked organization activation token",
             )
 
-        if tok_row["expires_at"] and tok_row["expires_at"] <= now:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Organization activation token has expired",
-            )
+        if tok_row is not None:
+            # Enforce single-use / usage limit if max_usages is set
+            max_u = tok_row["max_usages"] if "max_usages" in tok_row.keys() else None
+            if max_u is not None and tok_row["usage_count"] >= max_u:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Organization activation token usage limit reached (token already consumed)",
+                )
 
-        org_id = tok_row["organization_id"]
+            if tok_row["enabled"] != 1 or tok_row["revoked_at"] is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid, expired, or revoked organization activation token",
+                )
+
+            if tok_row["expires_at"] and tok_row["expires_at"] <= now:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Organization activation token has expired",
+                )
+
+            org_id = tok_row["organization_id"]
 
         # 2. Anti-overwrite rate-limiting protection
         recent = db_execute(
@@ -3284,16 +3370,32 @@ def workstation_bootstrap_pairing(
             (now, machine_id),
         )
 
-        # 4. Increment usage count and update last_used_at
-        db_execute(
-            conn,
-            """
-            UPDATE organization_activation_tokens
-            SET usage_count = usage_count + 1, last_used_at = ?
-            WHERE token_hash = ?
-            """,
-            (now, token_h),
-        )
+        # 4. Increment usage count / burn single-use tokens
+        if is_enrollment_token:
+            db_execute(
+                conn,
+                """
+                UPDATE enrollment_tokens
+                SET consumed_at = ?, consumed_by_machine_id = ?
+                WHERE token = ?
+                """,
+                (now, machine_id, payload.activation_token),
+            )
+        else:
+            new_usage = tok_row["usage_count"] + 1
+            max_u = tok_row["max_usages"] if "max_usages" in tok_row.keys() else None
+            disable_token = 1 if (max_u is not None and new_usage >= max_u) else 0
+            db_execute(
+                conn,
+                """
+                UPDATE organization_activation_tokens
+                SET usage_count = ?,
+                    last_used_at = ?,
+                    enabled = CASE WHEN ? = 1 THEN 0 ELSE enabled END
+                WHERE token_hash = ?
+                """,
+                (new_usage, now, disable_token, token_h),
+            )
 
         # 5. Insert new pairing record with hashes
         db_execute(
@@ -3669,6 +3771,109 @@ def mobile_pair_workstation(
             user_id = resolve_or_create_autodesk_user(conn, autodesk_userinfo)
 
         return execute_workstation_pairing(conn, user_id, code)
+
+
+class UnpairWorkstationRequest(BaseModel):
+    machine_id: str = Field(min_length=1, max_length=128)
+
+
+@app.post("/api/mobile/unpair-workstation")
+def mobile_unpair_workstation(
+    payload: UnpairWorkstationRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict[str, Any]:
+    """
+    Unpairs a workstation from the requesting authenticated mobile user.
+    - Disables mobile_user_machine_access for (user_id, machine_id).
+    - Revokes ONLY the workstation API credential associated with this pairing.
+    - Preserves historical jobs, job_events, job_notifications, machines row,
+      and any other users' access to this workstation.
+    """
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    try:
+        jwt_payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+        )
+        user_id = jwt_payload.get("sub")
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid access token",
+            )
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token",
+        )
+
+    machine_id = payload.machine_id.strip()
+
+    with get_db() as conn:
+        user_row = db_execute(
+            conn,
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if user_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User no longer exists",
+            )
+
+        # Check access relationship
+        access_row = db_execute(
+            conn,
+            """
+            SELECT user_id, machine_id, enabled
+            FROM mobile_user_machine_access
+            WHERE user_id = ? AND machine_id = ?
+            """,
+            (user_id, machine_id),
+        ).fetchone()
+
+        if access_row is None or not access_row["enabled"]:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Workstation '{machine_id}' is not paired with this user",
+            )
+
+        # 1. Disable mobile_user_machine_access for ONLY this user and workstation
+        db_execute(
+            conn,
+            """
+            UPDATE mobile_user_machine_access
+            SET enabled = 0
+            WHERE user_id = ? AND machine_id = ?
+            """,
+            (user_id, machine_id),
+        )
+
+        # 2. Revoke ONLY the workstation API credential associated with this user's pairing
+        db_execute(
+            conn,
+            """
+            UPDATE api_clients
+            SET enabled = 0
+            WHERE user_id = ? AND machine_id = ?
+            """,
+            (user_id, machine_id),
+        )
+
+        conn.commit()
+
+        return {
+            "status": "unpaired",
+            "user_id": user_id,
+            "machine_id": machine_id,
+            "message": "Workstation unpaired successfully",
+        }
 
 
 class PollPairingRequest(BaseModel):
