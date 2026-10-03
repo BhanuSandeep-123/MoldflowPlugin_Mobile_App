@@ -412,7 +412,7 @@ def _notification_recipient_user_ids(conn, user_id: str, job_id: str) -> list[st
                 """
                 SELECT user_id
                 FROM mobile_user_machine_access
-                WHERE machine_id = ?
+                WHERE LOWER(machine_id) = LOWER(?)
                   AND enabled = 1
                 """,
                 (job["machine_id"],),
@@ -1784,10 +1784,21 @@ def register_device(
             ),
         )
 
+        # Deduplicate: remove any other device row with this same push token
+        db_execute(
+            conn,
+            """
+            DELETE FROM devices
+            WHERE push_token = ?
+              AND device_id <> ?
+            """,
+            (device.push_token, device.device_id),
+        )
+
         conn.commit()
 
     # ------------------------------------------------------------------------
-    # Catch-up: Check for active INPROGRESS jobs where STARTED notification has
+    # Catch-up: Check for active INPROGRESS/RUNNING jobs where STARTED notification has
     # not yet been delivered (e.g. job started before this device registered).
     # ------------------------------------------------------------------------
     authenticated_user_id = user["user_id"]
@@ -1807,7 +1818,8 @@ def register_device(
         for candidate in active_candidates:
             if _bool_value(candidate["finished"]):
                 continue
-            curr_status = (candidate["status"] or "").strip().upper()
+            raw_curr = (candidate["status"] or "").strip().upper()
+            curr_status = "INPROGRESS" if raw_curr == "RUNNING" else raw_curr
             if curr_status not in ("INPROGRESS", "STARTED"):
                 continue
             send_job_completion_notification(
@@ -1850,11 +1862,17 @@ def send_job_completion_notification(
     CANCELED   -> cancellation notification
     """
 
-    normalized_status = (
+    raw_status = (
         (status_value or "")
         .strip()
         .upper()
     )
+    if raw_status == "RUNNING":
+        normalized_status = "INPROGRESS"
+    elif raw_status in ("CANCELLED", "CANCELED"):
+        normalized_status = "CANCELED"
+    else:
+        normalized_status = raw_status
 
     if normalized_status not in {
         "INPROGRESS",
@@ -1914,6 +1932,19 @@ def send_job_completion_notification(
             tuple(recipient_ids),
         ).fetchall()
 
+        job_row = db_execute(
+            conn,
+            "SELECT machine_id FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        machine_id = job_row["machine_id"] if job_row else None
+
+    print(
+        f"[FCM] Notification attempt: job={job_id} type={notification_type} "
+        f"user_id={user_id} machine_id={machine_id} recipients={len(recipient_ids)} "
+        f"token_count={len(devices)}"
+    )
+
     if not devices:
         print(
             f"[FCM] No registered Android devices "
@@ -1946,6 +1977,12 @@ def send_job_completion_notification(
     for device in devices:
         device_id = device["device_id"]
         push_token = device["push_token"]
+        has_token = bool(push_token and push_token.strip())
+
+        print(
+            f"[FCM] Notification send attempt: device={device_id} "
+            f"user={device['device_user_id']} token_exists={has_token}"
+        )
 
         try:
             send_fcm_notification(
@@ -1966,17 +2003,16 @@ def send_job_completion_notification(
             )
 
             print(
-                f"[FCM] Sent notification "
-                f"device={device_id} "
-                f"job={job_id} "
-                f"type={notification_type}"
+                f"[FCM] Notification result: SUCCESS device={device_id} "
+                f"job={job_id} type={notification_type}"
             )
 
             sent_successfully = True
 
         except UnregisteredDeviceError as ex:
             print(
-                f"[FCM] Dead/unregistered device token detected for device={device_id}: {ex}"
+                f"[FCM] Notification result: FAILED (UnregisteredDeviceError) "
+                f"device={device_id} error={ex}"
             )
             try:
                 with get_db() as conn:
@@ -2000,8 +2036,7 @@ def send_job_completion_notification(
 
         except Exception as ex:
             print(
-                f"[FCM] Failed notification "
-                f"device={device_id}: {ex}"
+                f"[FCM] Notification result: FAILED device={device_id} error={ex}"
             )
 
     if sent_successfully:
