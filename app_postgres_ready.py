@@ -1346,9 +1346,6 @@ def mobile_login(
                 detail="Invalid email or password",
             )
 
-        # Entitlement gate: user must have a Moldflow-licensed workstation
-        check_moldflow_entitlement(row["user_id"], conn)
-
         token, expires_in = create_access_token(
             row["user_id"]
         )
